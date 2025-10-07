@@ -1,0 +1,9 @@
+venv/
+videos/*.mp4
+output/*.mp4
+output/*.json
+input/*.wav
+/*.mp3
+/*.wav
+/*.mp4
+/*.txt
