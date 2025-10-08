@@ -1,7 +1,9 @@
+library/
 venv/
 videos/*.mp4
 output/*.mp4
 output/*.json
+input/*.mp3
 input/*.wav
 /*.mp3
 /*.wav
