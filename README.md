@@ -8,4 +8,4 @@ Finally, it generates an FFmpeg filter graph which trims, zooms/pans, scales, ce
 
 ## Please Note
 
-AV-Sync is a resource heavy application, especially with regards to CPU and RAM. So please start small with your projects and have a good time.
+AV-Sync is an exceptionally resource heavy application, particularly with regards to the CPU and RAM. So please start small with your projects and have a good time.
