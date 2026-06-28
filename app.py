@@ -1,4 +1,4 @@
-import argparse, json, math, subprocess, shutil, random, os
+import argparse, json, math, subprocess, shutil, random
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
@@ -97,14 +97,6 @@ def track_beats(
     tempo_max: float = 180.0,
     tracker: str = "dynamic"
 ) -> Tuple[float, np.ndarray, np.ndarray]:
-    """Robust beat tracking with tempo octave correction.
-
-    Returns (tempo_bpm, beat_frames, beat_times). Beat tracking is prone to
-    half/double-tempo errors, so the estimated tempo is folded into
-    [tempo_min, tempo_max] and, if that changed it materially, beats are
-    re-tracked pinned to the corrected tempo. ``tracker="plp"`` instead derives
-    beats from the predominant-local-pulse curve, which follows tempo drift.
-    """
     def fold_octave(bpm: float) -> float:
         if bpm <= 0:
             return start_bpm
@@ -150,7 +142,6 @@ def track_beats(
     return float(tempo), np.asarray(beat_frames), beat_times
 
 def _merge_min_seg(segs: List[Tuple[float, float]], min_seg: float, duration: float) -> List[Tuple[float, float]]:
-    """Merge consecutive segments shorter than min_seg into their neighbour."""
     merged: List[Tuple[float, float]] = []
     carry = None
     for s, e in segs:
@@ -174,12 +165,6 @@ def _snap_segments(
     tol_s: float,
     duration: float
 ) -> List[Tuple[float, float]]:
-    """Snap interior cut points to the nearest beat when within tol_s.
-
-    Onset/bar boundaries carry detection jitter and often sit slightly off the
-    pulse; pulling them onto the beat grid is what makes cuts read as 'locked'.
-    The first (0.0) and last (duration) boundaries are left untouched.
-    """
     if beat_times is None or len(beat_times) == 0 or tol_s <= 0 or len(segs) < 2:
         return segs
     bts = np.asarray(beat_times, dtype=float)
@@ -618,12 +603,6 @@ def analyze_audio_segments(
     return {"sr": sr, "duration": duration, "tempo": float(tempo), "segments": out, "curves": curves}
 
 def _prep(frame: np.ndarray, target_w: int = 320) -> np.ndarray:
-    """Downscale to a fixed working width and convert to grayscale.
-
-    Motion magnitude is robust to resolution, so shrinking before optical
-    flow / frame differencing cuts the dominant CPU cost with negligible
-    effect on the relative scores we bucket by.
-    """
     h, w = frame.shape[:2]
     if w > target_w:
         scale = target_w / float(w)
@@ -1291,92 +1270,32 @@ def build_ffmpeg_graph(
     ]
     return cmd
 
-def main():
-    ap = argparse.ArgumentParser(description="Beat/onset-synced visual editor using ffmpeg (no MoviePy).")
-    ap.add_argument("--audio",      required=True)
-    ap.add_argument("--videos_dir", required=True)
-    ap.add_argument("--out",        required=True)
+AUDIO_EXTS = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wma")
 
-    ap.add_argument("--segment-mode", choices=["auto", "onsets", "bars", "grid"], default="auto")
-    ap.add_argument("--bpm",    type=float, default=0.0, help="Required for segment-mode=grid. Also used for pulse.")
-    ap.add_argument("--subdiv", type=int,   default=1,   help="For grid mode: beats subdiv (1=beats, 2=half, 4=quarter, etc.)")
+def find_audio_files(input_dir: str) -> List[str]:
+    p = Path(input_dir)
+    if not p.is_dir():
+        return []
+    return sorted(str(f) for f in p.glob("*") if f.suffix.lower() in AUDIO_EXTS)
 
-    ap.add_argument("--min-seg",          type=float, default=0.35)
-    ap.add_argument("--hop",              type=int,   default=256)
-    ap.add_argument("--n-fft",            type=int,   default=1024, help="FFT size (default 1024; use 2048 for higher freq resolution).")
-    ap.add_argument("--percussive-boost", type=float, default=1.0)
-
-    ap.add_argument("--onset-delta",    type=float, default=0.08)
-    ap.add_argument("--onset-pre-max",  type=int,   default=12)
-    ap.add_argument("--onset-post-max", type=int,   default=12)
-    ap.add_argument("--onset-pre-avg",  type=int,   default=50)
-    ap.add_argument("--onset-post-avg", type=int,   default=50)
-    ap.add_argument("--onset-backtrack", action=argparse.BooleanOptionalAction, default=True,
-                    help="Backtrack onsets to the local energy minimum (attack start) for tighter cuts. On by default; use --no-onset-backtrack to disable.")
-
-    ap.add_argument("--start-bpm",   type=float, default=120.0, help="Tempo prior for beat tracking.")
-    ap.add_argument("--tempo-min",   type=float, default=70.0,  help="Lower bound for tempo octave correction.")
-    ap.add_argument("--tempo-max",   type=float, default=180.0, help="Upper bound for tempo octave correction.")
-    ap.add_argument("--beat-tracker", choices=["dynamic", "plp"], default="dynamic",
-                    help="'dynamic' = beat_track with octave correction; 'plp' follows tempo drift.")
-    ap.add_argument("--snap", action=argparse.BooleanOptionalAction, default=True,
-                    help="Snap onset/bar cut points onto the beat grid. On by default.")
-    ap.add_argument("--snap-tol-beats", type=float, default=0.5,
-                    help="Max distance (in beats) a cut may be moved to reach a beat.")
-    ap.add_argument("--beats-per-bar",  type=int, default=4, help="Beats per bar for downbeat detection / bars mode.")
-    ap.add_argument("--cut-lead", type=int, default=0,
-                    help="Shift cuts this many frames earlier so the new shot leads the beat.")
-
-    ap.add_argument("--f0", action="store_true",
-                    help="Enable F0/pitch analysis (adds voiced_pct & f0_median_hz features; slow).")
-
-    ap.add_argument("--clip-strategy",    choices=["timeline", "random"], default="timeline")
-    ap.add_argument("--vt-step",          type=float, default=0.25)
-    ap.add_argument("--vt-max-samples",   type=int,   default=1200)
-    ap.add_argument("--motion-method",    choices=["flow", "diff"], default="diff",
-                    help="Motion scoring method. 'diff' is ~20x faster than 'flow' with similar bucketing accuracy.")
-    ap.add_argument("--workers",          type=int, default=0,
-                    help="Parallel processes for video scoring (0 = all CPU cores).")
-    ap.add_argument("--clip-jitter",      type=float, default=0.15)
-    ap.add_argument("--no-reuse",         type=float, default=1.25)
-    ap.add_argument("--diversity-cooldown", type=int, default=3,
-                    help="Minimum distinct sources between reuses (lower bound when --min-source-gap is auto).")
-    ap.add_argument("--min-source-gap",   type=int, default=0,
-                    help="Min distinct sources that must intervene before a source repeats. 0 = auto (~half the library).")
-    ap.add_argument("--clip-topk",        type=int, default=4,
-                    help="Randomly pick among this many best-matching eligible sources (higher = more varied order).")
-    ap.add_argument("--pairing",          choices=["classic", "smart"], default="smart")
-
-    ap.add_argument("--curve-method", choices=["novelty", "onset", "rms"], default="novelty")
-    ap.add_argument("--curve-weight", type=float, default=0.60,
-                    help="0..1 weight for curve correlation vs pace/burst match.")
-    ap.add_argument("--align-weight", type=float, default=0.25,
-                    help="Weight for aligning the clip's motion peak to the segment's musical accent (0 disables).")
-
-    ap.add_argument("--fps",    type=int, default=30)
-    ap.add_argument("--width",  type=int, default=1280)
-    ap.add_argument("--height", type=int, default=720)
-    ap.add_argument("--crf",    type=int, default=18)
-    ap.add_argument("--preset", default="medium")
-    ap.add_argument("--manifest", default=None)
-
-    ap.add_argument("--pulse-strength", type=float, default=0.06)
-    ap.add_argument("--trail-frames",   type=int,   default=6)
-    ap.add_argument("--trail-decay",    type=float, default=0.70)
-    ap.add_argument("--trail-opacity",  type=float, default=0.35)
-    ap.add_argument("--trail-mode",     choices=["screen", "lighten", "addition", "overlay"], default="screen")
-
-    args = ap.parse_args()
-    has_ffmpeg()
+def process_one(
+    audio_path: str,
+    out_path: Path,
+    args,
+    bucket_index: Dict[str, List[Dict]],
+    timeline_cache: Dict[str, Dict[str, np.ndarray]],
+    manifest_path: Optional[Path] = None,
+    label: str = ""
+) -> None:
     random.seed(1337)
     np.random.seed(1337)
 
-    out_path = Path(args.out)
+    out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print("Analyzing audio…")
+    print(f"{label}Analyzing audio: {audio_path}")
     audio_info = analyze_audio_segments(
-        args.audio,
+        audio_path,
         min_seg=args.min_seg,
         hop=args.hop,
         n_fft=args.n_fft,
@@ -1402,7 +1321,7 @@ def main():
 
     segments = audio_info["segments"]
     if not segments:
-        raise RuntimeError("No segments found.")
+        raise RuntimeError(f"No segments found in {audio_path}.")
 
     rms_vals   = np.array([s["features"]["rms"]       for s in segments], dtype=float)
     onset_vals = np.array([s["features"]["onset_avg"] for s in segments], dtype=float)
@@ -1420,7 +1339,7 @@ def main():
     for s in segments:
         s["bucket"] = classify_audio_segment(s["features"], rms_q, onset_q)
 
-    print(f"Building audio segment curves ({args.curve_method}) for curve-matching…")
+    print(f"{label}Building audio segment curves ({args.curve_method})...")
     audio_seg_curves = None
     if args.clip_strategy == "timeline":
         audio_seg_curves = build_audio_curve_for_segments(
@@ -1430,19 +1349,7 @@ def main():
             curve_method=args.curve_method
         )
 
-    print("Scoring candidate videos…")
-    workers = args.workers if args.workers and args.workers > 0 else None
-    scored, timeline_cache = score_all_videos(
-        args.videos_dir,
-        motion_method=args.motion_method,
-        clip_strategy=args.clip_strategy,
-        vt_step=args.vt_step,
-        vt_max_samples=args.vt_max_samples,
-        workers=workers
-    )
-    bucket_index = build_bucket_index(scored)
-
-    print("Choosing diverse clip regions…")
+    print(f"{label}Choosing diverse clip regions...")
     chosen = choose_clips_for_segments(
         segments=segments,
         bucket_index=bucket_index,
@@ -1462,9 +1369,10 @@ def main():
         timeline_cache=timeline_cache
     )
 
-    manifest_path = Path(args.manifest) if args.manifest else out_path.with_suffix(".json")
+    if manifest_path is None:
+        manifest_path = out_path.with_suffix(".json")
     meta = {
-        "audio_path":     args.audio,
+        "audio_path":     audio_path,
         "videos_dir":     args.videos_dir,
         "output_path":    str(out_path),
         "sr":             audio_info["sr"],
@@ -1504,11 +1412,11 @@ def main():
     }
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
-    print(f"Wrote manifest: {manifest_path}")
+    print(f"{label}Wrote manifest: {manifest_path}")
 
-    print("Building ffmpeg graph…")
+    print(f"{label}Building ffmpeg graph...")
     cmd = build_ffmpeg_graph(
-        audio_path=args.audio,
+        audio_path=audio_path,
         segments=segments,
         chosen=chosen,
         fps=args.fps,
@@ -1526,9 +1434,155 @@ def main():
         cut_lead_frames=args.cut_lead
     )
 
-    print("Rendering with ffmpeg…")
+    print(f"{label}Rendering with ffmpeg...")
     run(cmd)
-    print(f"Done → {out_path}")
+    print(f"{label}Done -> {out_path}")
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Beat/onset-synced visual editor using ffmpeg (no MoviePy). "
+                    "Run with no arguments to render every audio file in ./input "
+                    "against ./videos, writing one video per track to ./output."
+    )
+    ap.add_argument("--audio", default=None,
+                    help="Single audio file to render. If omitted, every audio file "
+                         "in --input-dir is rendered (one output video each).")
+    ap.add_argument("--input-dir", "--input_dir", dest="input_dir", default="input",
+                    help="Directory scanned for audio files when --audio is omitted (default: input).")
+    ap.add_argument("--videos-dir", "--videos_dir", dest="videos_dir", default="videos",
+                    metavar="VIDEOS_DIR",
+                    help="Directory of source video clips (default: videos).")
+    ap.add_argument("--out", default=None,
+                    help="Output path (single-file mode only). In batch mode one file "
+                         "per input is written to --out-dir.")
+    ap.add_argument("--out-dir", "--out_dir", dest="out_dir", default="output",
+                    help="Directory for rendered videos and manifests (default: output).")
+
+    ap.add_argument("--segment-mode", choices=["auto", "onsets", "bars", "grid"], default="auto")
+    ap.add_argument("--bpm",    type=float, default=0.0, help="Required for segment-mode=grid. Also used for pulse.")
+    ap.add_argument("--subdiv", type=int,   default=1,   help="For grid mode: beats subdiv (1=beats, 2=half, 4=quarter, etc.)")
+
+    ap.add_argument("--min-seg",          type=float, default=0.20,
+                    help="Minimum segment length (s). Lower = tighter, faster cuts (default: 0.20).")
+    ap.add_argument("--hop",              type=int,   default=256)
+    ap.add_argument("--n-fft",            type=int,   default=1024, help="FFT size (default 1024; use 2048 for higher freq resolution).")
+    ap.add_argument("--percussive-boost", type=float, default=1.0)
+
+    ap.add_argument("--onset-delta",    type=float, default=0.08)
+    ap.add_argument("--onset-pre-max",  type=int,   default=12)
+    ap.add_argument("--onset-post-max", type=int,   default=12)
+    ap.add_argument("--onset-pre-avg",  type=int,   default=50)
+    ap.add_argument("--onset-post-avg", type=int,   default=50)
+    ap.add_argument("--onset-backtrack", action=argparse.BooleanOptionalAction, default=True,
+                    help="Backtrack onsets to the local energy minimum (attack start) for tighter cuts. On by default; use --no-onset-backtrack to disable.")
+
+    ap.add_argument("--start-bpm",   type=float, default=120.0, help="Tempo prior for beat tracking.")
+    ap.add_argument("--tempo-min",   type=float, default=70.0,  help="Lower bound for tempo octave correction.")
+    ap.add_argument("--tempo-max",   type=float, default=180.0, help="Upper bound for tempo octave correction.")
+    ap.add_argument("--beat-tracker", choices=["dynamic", "plp"], default="dynamic",
+                    help="'dynamic' = beat_track with octave correction; 'plp' follows tempo drift.")
+    ap.add_argument("--snap", action=argparse.BooleanOptionalAction, default=True,
+                    help="Snap onset/bar cut points onto the beat grid. On by default.")
+    ap.add_argument("--snap-tol-beats", type=float, default=0.5,
+                    help="Max distance (in beats) a cut may be moved to reach a beat.")
+    ap.add_argument("--beats-per-bar",  type=int, default=4, help="Beats per bar for downbeat detection / bars mode.")
+    ap.add_argument("--cut-lead", type=int, default=1,
+                    help="Shift cuts this many frames earlier so the new shot leads the beat.")
+
+    ap.add_argument("--f0", action="store_true",
+                    help="Enable F0/pitch analysis (adds voiced_pct & f0_median_hz features; slow).")
+
+    ap.add_argument("--clip-strategy",    choices=["timeline", "random"], default="timeline")
+    ap.add_argument("--vt-step",          type=float, default=0.25)
+    ap.add_argument("--vt-max-samples",   type=int,   default=1200)
+    ap.add_argument("--motion-method",    choices=["flow", "diff"], default="diff",
+                    help="Motion scoring method. 'diff' is ~20x faster than 'flow' with similar bucketing accuracy.")
+    ap.add_argument("--workers",          type=int, default=0,
+                    help="Parallel processes for video scoring (0 = all CPU cores).")
+    ap.add_argument("--clip-jitter",      type=float, default=0.10)
+    ap.add_argument("--no-reuse",         type=float, default=1.25)
+    ap.add_argument("--diversity-cooldown", type=int, default=3,
+                    help="Minimum distinct sources between reuses (lower bound when --min-source-gap is auto).")
+    ap.add_argument("--min-source-gap",   type=int, default=0,
+                    help="Min distinct sources that must intervene before a source repeats. 0 = auto (~half the library).")
+    ap.add_argument("--clip-topk",        type=int, default=4,
+                    help="Randomly pick among this many best-matching eligible sources (higher = more varied order).")
+    ap.add_argument("--pairing",          choices=["classic", "smart"], default="smart")
+
+    ap.add_argument("--curve-method", choices=["novelty", "onset", "rms"], default="novelty")
+    ap.add_argument("--curve-weight", type=float, default=0.60,
+                    help="0..1 weight for curve correlation vs pace/burst match.")
+    ap.add_argument("--align-weight", type=float, default=0.30,
+                    help="Weight for aligning the clip's motion peak to the segment's musical accent (0 disables).")
+
+    ap.add_argument("--fps",    type=int, default=30)
+    ap.add_argument("--width",  type=int, default=1280)
+    ap.add_argument("--height", type=int, default=720)
+    ap.add_argument("--crf",    type=int, default=18)
+    ap.add_argument("--preset", default="medium")
+    ap.add_argument("--manifest", default=None)
+
+    ap.add_argument("--pulse-strength", type=float, default=0.06)
+    ap.add_argument("--trail-frames",   type=int,   default=6)
+    ap.add_argument("--trail-decay",    type=float, default=0.70)
+    ap.add_argument("--trail-opacity",  type=float, default=0.35)
+    ap.add_argument("--trail-mode",     choices=["screen", "lighten", "addition", "overlay"], default="screen")
+
+    args = ap.parse_args()
+    has_ffmpeg()
+    if args.audio:
+        audio_files = [args.audio]
+    else:
+        audio_files = find_audio_files(args.input_dir)
+        if not audio_files:
+            raise RuntimeError(
+                f"No audio files found in '{args.input_dir}'. Add one "
+                f"(e.g. {args.input_dir}/song.mp3) or pass --audio PATH."
+            )
+        print(f"Found {len(audio_files)} audio file(s) in '{args.input_dir}'.")
+
+    single = len(audio_files) == 1
+    if args.out and not single:
+        print(f"Note: --out is ignored in batch mode; writing one file per input to '{args.out_dir}'.")
+
+    jobs: List[Tuple[str, Path]] = []
+    for af in audio_files:
+        if single and args.out:
+            out_path = Path(args.out)
+        else:
+            out_path = Path(args.out_dir) / (Path(af).stem + ".mp4")
+        jobs.append((af, out_path))
+
+    print("Scoring candidate videos...")
+    workers = args.workers if args.workers and args.workers > 0 else None
+    scored, timeline_cache = score_all_videos(
+        args.videos_dir,
+        motion_method=args.motion_method,
+        clip_strategy=args.clip_strategy,
+        vt_step=args.vt_step,
+        vt_max_samples=args.vt_max_samples,
+        workers=workers
+    )
+    bucket_index = build_bucket_index(scored)
+
+    failures = 0
+    for i, (audio_path, out_path) in enumerate(jobs, start=1):
+        label = f"[{i}/{len(jobs)}] " if len(jobs) > 1 else ""
+        manifest_path = Path(args.manifest) if (args.manifest and single) else None
+        try:
+            process_one(audio_path, out_path, args, bucket_index, timeline_cache,
+                        manifest_path=manifest_path, label=label)
+        except Exception as e:
+            if single:
+                raise
+            failures += 1
+            print(f"{label}ERROR processing {audio_path}: {e}")
+
+    if single:
+        print("All done.")
+    else:
+        rendered = len(jobs) - failures
+        print(f"All done. Rendered {rendered}/{len(jobs)} video(s) to '{args.out_dir}'.")
 
 if __name__ == "__main__":
     main()
