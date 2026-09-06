@@ -1161,9 +1161,11 @@ def build_ffmpeg_graph(
 ):
     cut_lead_frames = int(max(0, cut_lead_frames))
     seg_frames: List[int] = []
+    seg_start_frames: List[int] = []
     cum_time   = 0.0
     prev_frame = 0
     for seg in segments:
+        seg_start_frames.append(prev_frame)
         cum_time  += max(0.0, float(seg["duration"]))
         cur_frame  = int(round(cum_time * fps)) - cut_lead_frames
         cur_frame  = max(prev_frame + 1, cur_frame)
@@ -1239,7 +1241,8 @@ def build_ffmpeg_graph(
 
         if enable_pulse:
             amp    = pulse_strength * pulse_scale_for_bucket(bucket)
-            chain += f",hue=s='1+{amp:.6f}*sin(2*PI*{beats_per_sec:.6f}*t)'"
+            seg_t0 = seg_start_frames[i-1] / float(fps)
+            chain += f",hue=s='1+{amp:.6f}*sin(2*PI*{beats_per_sec:.6f}*(t+{seg_t0:.6f}))'"
 
         midlab  = f"seg{i}"
         chain  += f"[{midlab}]"
