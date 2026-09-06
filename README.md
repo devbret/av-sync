@@ -48,6 +48,10 @@ Below are the required software programs and instructions for installing and usi
 
 ## Other Considerations
 
+Below you will find information not covered in the installation and use sections above. Including the abilities this repo is intended to demonstrate. As well as an overview of the license this code is made available with. And a way to contact the maintainer with questions, suggestions and collaboration opportunities.
+
+### Abilities Demonstrated
+
 This project repo is intended to demonstrate an ability to do the following:
 
 - Turn an audio track and a folder of video clips into a beat-synced music video
@@ -58,8 +62,8 @@ This project repo is intended to demonstrate an ability to do the following:
 
 - Save a JSON manifest of the audio analysis, clip choices, timing and placement data
 
+### License Information
+
+This repository is distributed under the MIT License. You are free to use, copy, modify, merge, publish, distribute, sublicense and sell copies of this software, including as part of proprietary or commercial work. The single condition is the copyright and permission notices contained in the LICENSE file must be included with any copy or substantial portion of the software that you redistribute. The software is provided "as is", without warranty of any kind, and the copyright holder is not liable for any claim or damages arising from its use.
+
 If you have any questions or would like to collaborate, please reach out either on GitHub or via [my website](https://bretbernhoft.com/).
-
-### Please Note
-
-AV-Sync can be an exceptionally resource heavy application, particularly with regards to the CPU and RAM. So please start small with your projects and have a good time.
