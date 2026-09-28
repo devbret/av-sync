@@ -600,7 +600,8 @@ def analyze_audio_segments(
         "rms":       rms_s.astype(float),
     }
 
-    return {"sr": sr, "duration": duration, "tempo": float(tempo), "segments": out, "curves": curves}
+    return {"sr": sr, "duration": duration, "tempo": float(tempo), "beat_times": beat_times_arr,
+            "segments": out, "curves": curves}
 
 def _prep(frame: np.ndarray, target_w: int = 320) -> np.ndarray:
     h, w = frame.shape[:2]
@@ -954,6 +955,10 @@ def pick_region_by_timeline_windowed(
     base_weight  = 1.0 - curve_weight
     align_weight = float(max(0.0, align_weight))
 
+    curve_ok = seg_curve is not None and seg_curve.size >= 2 and win >= 3
+    if curve_ok:
+        seg_curve = _interp_curve(np.linspace(0.0, 1.0, seg_curve.size), seg_curve, np.linspace(0.0, 1.0, win))
+
     seg_peak_frac = None
     if seg_curve is not None and seg_curve.size >= 2:
         seg_peak_frac = float(np.argmax(seg_curve)) / float(seg_curve.size - 1)
@@ -973,7 +978,7 @@ def pick_region_by_timeline_windowed(
         win_scores = scores[idx:idx + win].astype(float)
 
         d_curve = 1.0
-        if seg_curve is not None and seg_curve.size >= 2:
+        if curve_ok:
             w01, _, _  = _minmax01(win_scores)
             d_curve    = _corr_distance(seg_curve.astype(float), w01.astype(float))
 
@@ -1017,6 +1022,7 @@ def choose_clips_for_segments(
     align_weight: float = 0.25,
     min_source_gap: int = 0,
     clip_topk: int = 4,
+    reuse_penalty: float = 0.30,
     timeline_cache: Optional[Dict[str, Dict[str, np.ndarray]]] = None
 ) -> List[Dict]:
     video_meta: Dict[str, Dict] = {}
@@ -1091,7 +1097,8 @@ def choose_clips_for_segments(
         if pairing == "smart":
             seg_prof_sel = seg_profiles[seg_idx]
             def match_of(cand):
-                return av_match_score_multi(seg_prof_sel, video_meta[cand["path"]], 0.0, 0.0)
+                reuse = reuse_penalty * use_count[cand["path"]]
+                return av_match_score_multi(seg_prof_sel, video_meta[cand["path"]], reuse, 0.0)
         else:
             def match_of(cand):
                 return 0.0
@@ -1152,7 +1159,8 @@ def build_ffmpeg_graph(
     preset: str,
     out_path: str,
     bpm: float = 0.0,
-    pulse_strength: float = 0.06,
+    beat_offset: float = 0.0,
+    pulse_strength: float = 0.15,
     trail_frames: int = 6,
     trail_decay: float = 0.70,
     trail_opacity: float = 0.35,
@@ -1172,7 +1180,6 @@ def build_ffmpeg_graph(
         seg_frames.append(cur_frame - prev_frame)
         prev_frame = cur_frame
 
-    src_durs = [c.get("src_dur") or ffprobe_duration(c["path"]) or 0.0 for c in chosen]
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", audio_path]
     for c, seg in zip(chosen, segments):
         start       = max(0.0, float(c.get("start", 0.0)))
@@ -1204,8 +1211,6 @@ def build_ffmpeg_graph(
     for i, (seg, ch) in enumerate(zip(segments, chosen), start=1):
         N       = max(1, int(seg_frames[i-1]))
         target  = N / float(fps)
-        srcdur  = float(src_durs[i-1])
-        start   = float(ch.get("start", 0.0))
         bucket  = str(ch.get("bucket", "medium"))
         style   = rng.choice(directions)
         zoom_amt= zoom_mag_for_bucket(bucket)
@@ -1226,23 +1231,19 @@ def build_ffmpeg_graph(
         x_expr = f"(iw-iw/zoom)/2+({pan_frac_x})*iw*{prog}"
         y_expr = f"(ih-ih/zoom)/2+({pan_frac_y})*ih*{prog}"
 
-        base  = f"[{i}:v]"
-        tail  = max(0.0, srcdur - start)
-        if tail >= target - 1e-4:
-            chain = base + f"trim=duration={target:.6f},setpts=PTS-STARTPTS"
-        else:
-            pad_dur = max(0.0, target - tail)
-            chain = base + f"trim=duration={tail:.6f},setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={pad_dur:.6f}"
+        chain  = f"[{i}:v]setpts=PTS-STARTPTS,fps={fps}"
+        chain += f",tpad=stop_mode=clone:stop_duration={target + 0.5:.6f}"
+        chain += f",trim=end_frame={N},setpts=PTS-STARTPTS"
 
-        chain += f",zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d=1"
-        chain += f",scale={width}:{height}:force_original_aspect_ratio=decrease"
-        chain += f",pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"
+        chain += f",scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos"
+        chain += f",crop={width}:{height},setsar=1"
+        chain += f",zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d=1:s={width}x{height}:fps={fps}"
         chain += f",eq=saturation=1.04:gamma=1.02"
 
         if enable_pulse:
             amp    = pulse_strength * pulse_scale_for_bucket(bucket)
             seg_t0 = seg_start_frames[i-1] / float(fps)
-            chain += f",hue=s='1+{amp:.6f}*sin(2*PI*{beats_per_sec:.6f}*(t+{seg_t0:.6f}))'"
+            chain += f",hue=s='1+{amp:.6f}*cos(2*PI*{beats_per_sec:.6f}*(t+{seg_t0 - beat_offset:.6f}))'"
 
         midlab  = f"seg{i}"
         chain  += f"[{midlab}]"
@@ -1251,9 +1252,9 @@ def build_ffmpeg_graph(
         if enable_trails:
             w      = trail_weights(trail_frames, trail_decay)
             trails = (
-                f"[{midlab}]format=yuv420p,split=2[{midlab}a][{midlab}b];"
+                f"[{midlab}]format=gbrp,split=2[{midlab}a][{midlab}b];"
                 f"[{midlab}b]tmix=frames={trail_frames}:weights='{w}'[{midlab}t];"
-                f"[{midlab}a][{midlab}t]blend=all_mode={trail_mode}:all_opacity={trail_opacity:.3f}[v{i}]"
+                f"[{midlab}a][{midlab}t]blend=all_mode={trail_mode}:all_opacity={trail_opacity:.3f},format=yuv420p[v{i}]"
             )
             filters.append(trails)
             labels.append(f"[v{i}]")
@@ -1369,8 +1370,13 @@ def process_one(
         align_weight=args.align_weight,
         min_source_gap=args.min_source_gap,
         clip_topk=args.clip_topk,
+        reuse_penalty=args.reuse_penalty,
         timeline_cache=timeline_cache
     )
+
+    pulse_bpm   = args.bpm if args.bpm and args.bpm > 0 else audio_info.get("tempo", 0.0)
+    beat_times  = audio_info.get("beat_times", np.array([]))
+    beat_offset = 0.0 if args.segment_mode == "grid" or len(beat_times) == 0 else float(beat_times[0])
 
     if manifest_path is None:
         manifest_path = out_path.with_suffix(".json")
@@ -1393,6 +1399,9 @@ def process_one(
         "cut_lead":       args.cut_lead,
         "min_source_gap": args.min_source_gap,
         "clip_topk":      args.clip_topk,
+        "reuse_penalty":  args.reuse_penalty,
+        "pulse_bpm":      pulse_bpm,
+        "beat_offset":    beat_offset,
         "clip_strategy":  args.clip_strategy,
         "motion_method":  args.motion_method,
         "curve_method":   args.curve_method,
@@ -1428,7 +1437,8 @@ def process_one(
         crf=args.crf,
         preset=args.preset,
         out_path=str(out_path),
-        bpm=args.bpm,
+        bpm=pulse_bpm,
+        beat_offset=beat_offset,
         pulse_strength=args.pulse_strength,
         trail_frames=args.trail_frames,
         trail_decay=args.trail_decay,
@@ -1462,7 +1472,8 @@ def main():
                     help="Directory for rendered videos and manifests (default: output).")
 
     ap.add_argument("--segment-mode", choices=["auto", "onsets", "bars", "grid"], default="auto")
-    ap.add_argument("--bpm",    type=float, default=0.0, help="Required for segment-mode=grid. Also used for pulse.")
+    ap.add_argument("--bpm",    type=float, default=0.0,
+                    help="Required for segment-mode=grid. Also overrides the detected tempo for the pulse.")
     ap.add_argument("--subdiv", type=int,   default=1,   help="For grid mode: beats subdiv (1=beats, 2=half, 4=quarter, etc.)")
 
     ap.add_argument("--min-seg",          type=float, default=0.20,
@@ -1496,7 +1507,9 @@ def main():
                     help="Enable F0/pitch analysis (adds voiced_pct & f0_median_hz features; slow).")
 
     ap.add_argument("--clip-strategy",    choices=["timeline", "random"], default="timeline")
-    ap.add_argument("--vt-step",          type=float, default=0.25)
+    ap.add_argument("--vt-step",          type=float, default=0.0625,
+                    help="Video motion timeline step (s). Keep well below the typical cut length so "
+                         "curve matching has several points per segment (default: 0.0625).")
     ap.add_argument("--vt-max-samples",   type=int,   default=1200)
     ap.add_argument("--motion-method",    choices=["flow", "diff"], default="diff",
                     help="Motion scoring method. 'diff' is ~20x faster than 'flow' with similar bucketing accuracy.")
@@ -1510,6 +1523,8 @@ def main():
                     help="Min distinct sources that must intervene before a source repeats. 0 = auto (~half the library).")
     ap.add_argument("--clip-topk",        type=int, default=4,
                     help="Randomly pick among this many best-matching eligible sources (higher = more varied order).")
+    ap.add_argument("--reuse-penalty",    type=float, default=0.30,
+                    help="Match-score penalty per prior use of a source, so unused clips win close matches (0 disables).")
     ap.add_argument("--pairing",          choices=["classic", "smart"], default="smart")
 
     ap.add_argument("--curve-method", choices=["novelty", "onset", "rms"], default="novelty")
@@ -1525,7 +1540,8 @@ def main():
     ap.add_argument("--preset", default="medium")
     ap.add_argument("--manifest", default=None)
 
-    ap.add_argument("--pulse-strength", type=float, default=0.06)
+    ap.add_argument("--pulse-strength", type=float, default=0.15,
+                    help="Beat-locked saturation pulse depth (0 disables; default: 0.15).")
     ap.add_argument("--trail-frames",   type=int,   default=6)
     ap.add_argument("--trail-decay",    type=float, default=0.70)
     ap.add_argument("--trail-opacity",  type=float, default=0.35)
