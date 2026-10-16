@@ -1,8 +1,8 @@
-import argparse, json, math, subprocess, shutil, random
+import argparse, json, math, os, subprocess, shutil, random, tempfile
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
-from collections import defaultdict
+from collections import namedtuple
 
 import numpy as np
 import librosa
@@ -118,7 +118,7 @@ def track_beats(
             pass
 
     tempo, beat_frames = librosa.beat.beat_track(
-        onset_envelope=onset_env, sr=sr, hop_length=hop, start_bpm=start_bpm, units="frames"
+        onset_envelope=onset_env, sr=sr, hop_length=hop, start_bpm=start_bpm, units="frames", trim=False
     )
     tempo = float(np.atleast_1d(tempo)[0])
     corrected = fold_octave(tempo)
@@ -126,7 +126,7 @@ def track_beats(
         try:
             tempo2, beat_frames2 = librosa.beat.beat_track(
                 onset_envelope=onset_env, sr=sr, hop_length=hop,
-                start_bpm=corrected, bpm=corrected, units="frames"
+                start_bpm=corrected, bpm=corrected, units="frames", trim=False
             )
             if np.size(beat_frames2) >= 2:
                 beat_frames = beat_frames2
@@ -140,6 +140,47 @@ def track_beats(
 
     beat_times = librosa.frames_to_time(np.asarray(beat_frames), sr=sr, hop_length=hop)
     return float(tempo), np.asarray(beat_frames), beat_times
+
+def _complete_beat_grid(beat_times: np.ndarray, tempo: float, duration: float) -> np.ndarray:
+    bt = np.unique(np.asarray(beat_times, dtype=float))
+    bt = bt[(bt >= 0.0) & (bt <= duration)]
+    if tempo and tempo > 0:
+        period = 60.0 / float(tempo)
+    elif bt.size >= 2:
+        period = float(np.median(np.diff(bt)))
+    else:
+        return bt
+    if period <= 1e-3:
+        return bt
+    if bt.size == 0:
+        return np.arange(0.0, duration, period, dtype=float)
+    filled = [float(bt[0])]
+    for a, b in zip(bt[:-1], bt[1:]):
+        gap = float(b - a)
+        n_missing = int(round(gap / period)) - 1
+        if n_missing >= 1 and gap > 1.5 * period:
+            local = gap / (n_missing + 1)
+            filled.extend(float(a + local * k) for k in range(1, n_missing + 1))
+        filled.append(float(b))
+    lead_in: List[float] = []
+    t = filled[0] - period
+    while t >= 0.0:
+        lead_in.append(t)
+        t -= period
+    tail: List[float] = []
+    t = filled[-1] + period
+    while t < duration - 1e-3:
+        tail.append(t)
+        t += period
+    return np.array(sorted(lead_in) + filled + tail, dtype=float)
+
+def _beat_strengths(env: np.ndarray, beat_frames: np.ndarray) -> np.ndarray:
+    frames = np.asarray(beat_frames, dtype=int)
+    if frames.size == 0 or env.size == 0:
+        return np.zeros(frames.size, dtype=float)
+    v  = env[np.clip(frames, 0, env.size - 1)]
+    hi = float(np.percentile(v, 95)) + 1e-9
+    return np.clip(v / hi, 0.0, 1.0)
 
 def _merge_min_seg(segs: List[Tuple[float, float]], min_seg: float, duration: float) -> List[Tuple[float, float]]:
     merged: List[Tuple[float, float]] = []
@@ -156,7 +197,10 @@ def _merge_min_seg(segs: List[Tuple[float, float]], min_seg: float, duration: fl
                 merged.append((carry[0], carry[1]))
                 carry = None
     if carry is not None:
-        merged.append((carry[0], carry[1]))
+        if merged and (carry[1] - carry[0]) < min_seg:
+            merged[-1] = (merged[-1][0], carry[1])
+        else:
+            merged.append((carry[0], carry[1]))
     return [(max(0.0, s), min(duration, e)) for s, e in merged if e > s + 1e-6]
 
 def _snap_segments(
@@ -196,7 +240,8 @@ def choose_segments(
     snap_tol_beats: float = 0.5,
     beats_per_bar: int = 4,
     bpm: float = 0.0,
-    subdiv: int = 1
+    subdiv: int = 1,
+    beat_refine_s: float = 0.06
 ) -> Tuple[List[Tuple[float, float]], float]:
     duration = len(y) / sr
 
@@ -251,6 +296,32 @@ def choose_segments(
         bars = sorted(set([0.0] + downbeats + [duration]))
         return [(bars[i], bars[i + 1]) for i in range(len(bars) - 1)]
 
+    if mode == "beats":
+        grid = np.asarray(beat_times, dtype=float)
+        grid = grid[(grid > 1e-3) & (grid < duration - 1e-3)]
+        subdiv = int(max(1, subdiv))
+        if subdiv > 1 and grid.size >= 2:
+            fine: List[float] = []
+            for a, b in zip(grid[:-1], grid[1:]):
+                fine.extend(float(a + (b - a) * k / subdiv) for k in range(subdiv))
+            fine.append(float(grid[-1]))
+            grid = np.array(fine, dtype=float)
+        if beat_refine_s > 0 and grid.size:
+            peak_kwargs = dict(onset_kwargs)
+            peak_kwargs["backtrack"] = False
+            peak_frames = detect_onsets_percussive(y_perc, sr, hop, n_fft, **peak_kwargs)
+            peaks = librosa.frames_to_time(peak_frames, sr=sr, hop_length=hop)
+            if peaks.size:
+                near = peaks[np.argmin(np.abs(peaks[None, :] - grid[:, None]), axis=1)]
+                grid = np.where(np.abs(near - grid) <= beat_refine_s, near, grid)
+        cuts = [0.0]
+        for g in sorted(set(float(x) for x in grid)):
+            if g > cuts[-1] + 1e-3 and g < duration - 1e-3:
+                cuts.append(g)
+        cuts.append(duration)
+        segs = [(cuts[i], cuts[i + 1]) for i in range(len(cuts) - 1) if cuts[i + 1] > cuts[i] + 1e-6]
+        return _merge_min_seg(segs, min_seg, duration), duration
+
     if mode == "onsets":
         segs = segments_from_onsets(onset_times)
     elif mode == "bars":
@@ -290,6 +361,99 @@ def key_mode_from_chroma(chroma_vec: np.ndarray) -> Tuple[str, float]:
     else:
         return "minor", sN / total
 
+QUIET_QUANTILE = 0.35
+
+def detect_sections(
+    mfcc: np.ndarray,
+    chroma: np.ndarray,
+    hop_times: np.ndarray,
+    duration: float,
+    k: int,
+    min_section_s: float,
+    beat_times: Optional[np.ndarray] = None,
+    beat_period: float = 0.0
+) -> List[float]:
+    n = min(mfcc.shape[1], chroma.shape[1], hop_times.size)
+    if n < 8 or duration < 2.0 * min_section_s:
+        return [0.0]
+    frame_dt = float(hop_times[1] - hop_times[0]) if n > 1 else 0.0116
+    stride   = max(1, int(round(0.25 / frame_dt)))
+    blocks   = np.arange(0, n, stride)
+    X  = np.vstack([mfcc[:, :n], chroma[:, :n]])
+    Xs = librosa.util.sync(X, blocks, aggregate=np.mean)
+    Xs = (Xs - Xs.mean(axis=1, keepdims=True)) / (Xs.std(axis=1, keepdims=True) + 1e-9)
+    if k <= 0:
+        k = int(np.clip(round(duration / 20.0), 2, 16))
+    k = int(min(k, max(1, Xs.shape[1] // 4)))
+    if k < 2:
+        return [0.0]
+    bounds = librosa.segment.agglomerative(Xs, k)
+    times  = [float(hop_times[min(n - 1, int(blocks[min(int(b), blocks.size - 1)]))]) for b in bounds]
+    if beat_times is not None and len(beat_times) and beat_period > 0:
+        bts = np.asarray(beat_times, dtype=float)
+        snapped = []
+        for t in times:
+            j  = int(np.argmin(np.abs(bts - t)))
+            nb = float(bts[j])
+            snapped.append(nb if abs(nb - t) <= 0.5 * beat_period else t)
+        times = snapped
+    kept = [0.0]
+    for t in sorted(set(times)):
+        if t - kept[-1] >= min_section_s and (duration - t) >= 0.5 * min_section_s:
+            kept.append(float(t))
+    return kept
+
+def _snap_to_segment_starts(times: List[float], segs: List[Tuple[float, float]]) -> List[float]:
+    if not segs:
+        return [0.0]
+    starts = np.array([s for s, _ in segs], dtype=float)
+    out = [0.0]
+    for t in times[1:]:
+        j  = int(np.argmin(np.abs(starts - t)))
+        st = float(starts[j])
+        if st > out[-1] + 1e-6:
+            out.append(st)
+    return out
+
+def _merge_quiet_segments(
+    segs: List[Tuple[float, float]],
+    rms_s: np.ndarray,
+    hop_times: np.ndarray,
+    hold_len: float,
+    section_times: List[float]
+) -> List[Tuple[float, float]]:
+    if len(segs) < 3 or hold_len <= 0:
+        return segs
+    energy = []
+    for s, e in segs:
+        i0 = int(np.searchsorted(hop_times, s, side="left"))
+        i1 = int(np.searchsorted(hop_times, e, side="left"))
+        energy.append(float(np.mean(rms_s[i0:i1])) if i1 > i0 else 0.0)
+    energy = np.array(energy, dtype=float)
+    thr    = float(np.quantile(energy, QUIET_QUANTILE))
+    starts = set(round(t, 6) for t in section_times)
+    out: List[Tuple[float, float]] = []
+    i = 0
+    while i < len(segs):
+        s, e = segs[i]
+        if energy[i] <= thr:
+            j = i + 1
+            while (j < len(segs) and energy[j] <= thr
+                   and (segs[j][1] - s) <= hold_len + 1e-6
+                   and round(segs[j][0], 6) not in starts):
+                e = segs[j][1]
+                j += 1
+            out.append((s, e))
+            i = j
+        else:
+            out.append((s, e))
+            i += 1
+    return out
+
+def _section_index_for_segments(segs: List[Tuple[float, float]], section_times: List[float]) -> List[int]:
+    st = np.array(section_times, dtype=float)
+    return [int(max(0, np.searchsorted(st, s + 1e-6, side="right") - 1)) for s, _ in segs]
+
 def analyze_audio_segments(
     audio_path: str,
     min_seg: float = 0.35,
@@ -312,7 +476,10 @@ def analyze_audio_segments(
     beat_tracker: str = "dynamic",
     snap: bool = True,
     snap_tol_beats: float = 0.5,
-    beats_per_bar: int = 4
+    beats_per_bar: int = 4,
+    sections: int = 0,
+    quiet_hold_beats: float = 0.0,
+    beat_refine_s: float = 0.06
 ) -> Dict:
     y, sr = librosa.load(audio_path, sr=22050, mono=True)
 
@@ -350,6 +517,9 @@ def analyze_audio_segments(
         env_perc, sr, hop, start_bpm=start_bpm,
         tempo_min=tempo_min, tempo_max=tempo_max, tracker=beat_tracker
     )
+    beat_times     = _complete_beat_grid(np.asarray(beat_times, dtype=float), tempo, len(y) / sr)
+    beat_frames    = librosa.time_to_frames(beat_times, sr=sr, hop_length=hop)
+    beat_strengths = _beat_strengths(env_perc, beat_frames)
 
     segments, duration = choose_segments(
         y=y,
@@ -368,7 +538,8 @@ def analyze_audio_segments(
         snap_tol_beats=snap_tol_beats,
         beats_per_bar=beats_per_bar,
         bpm=bpm,
-        subdiv=subdiv
+        subdiv=subdiv,
+        beat_refine_s=beat_refine_s
     )
 
     S_complex = librosa.stft(y, n_fft=n_fft, hop_length=hop, center=True, window="hann")
@@ -459,13 +630,21 @@ def analyze_audio_segments(
 
     hop_times = librosa.frames_to_time(np.arange(n), sr=sr, hop_length=hop)
 
+    beat_times_arr = np.asarray(beat_times, dtype=float) if len(beat_frames) else np.array([])
+    beat_period    = (60.0 / float(tempo)) if tempo and tempo > 0 else 0.0
+    min_section_s  = max(6.0, 2.0 * beats_per_bar * beat_period)
+    section_times  = detect_sections(mfcc, chroma[:, :n], hop_times, duration, sections, min_section_s,
+                                     beat_times_arr, beat_period)
+    section_times  = _snap_to_segment_starts(section_times, segments)
+    if quiet_hold_beats and quiet_hold_beats > 0 and beat_period > 0:
+        segments = _merge_quiet_segments(segments, rms_s, hop_times, float(quiet_hold_beats) * beat_period, section_times)
+    section_idx = _section_index_for_segments(segments, section_times)
+
     chroma_mean_track           = np.mean(chroma[:, :n], axis=1)
     global_mode, global_mode_conf = key_mode_from_chroma(chroma_mean_track)
 
-    beat_times_arr = np.asarray(beat_times, dtype=float) if len(beat_frames) else np.array([])
-
     out = []
-    for s, e in segments:
+    for k, (s, e) in enumerate(segments):
         i0   = int(np.searchsorted(hop_times, s, side='left'))
         i1   = int(np.searchsorted(hop_times, e, side='left'))
         sl   = slice(i0, i1)
@@ -476,6 +655,7 @@ def analyze_audio_segments(
         def seg_std(a):  return float(np.std(a[sl]))  if n_sl > 0 else 0.0
 
         rms_mean    = seg_mean(rms_s)
+        rms_slope   = float(np.polyfit(np.arange(n_sl, dtype=float), rms_s[sl], 1)[0] * n_sl / (rms_mean + 1e-9)) if n_sl >= 2 else 0.0
         cen_mean    = seg_mean(cen_s)
         zcr_mean    = seg_mean(zcr_s)
         on_mean     = seg_mean(on_s);     on_std     = seg_std(on_s)
@@ -549,8 +729,10 @@ def analyze_audio_segments(
             "start": float(s),
             "end": float(e),
             "duration": float(dur),
+            "section": int(section_idx[k]),
             "features": {
                 "rms": rms_mean,
+                "rms_slope": rms_slope,
                 "centroid": cen_mean,
                 "zcr": zcr_mean,
                 "onset_avg": on_mean,
@@ -600,112 +782,65 @@ def analyze_audio_segments(
         "rms":       rms_s.astype(float),
     }
 
+    sections_out = [
+        {"index": i, "start": float(t),
+         "end": float(section_times[i + 1] if i + 1 < len(section_times) else duration)}
+        for i, t in enumerate(section_times)
+    ]
+
     return {"sr": sr, "duration": duration, "tempo": float(tempo), "beat_times": beat_times_arr,
-            "segments": out, "curves": curves}
+            "beat_strengths": np.asarray(beat_strengths, dtype=float), "segments": out, "curves": curves,
+            "sections": sections_out}
 
 def _prep(frame: np.ndarray, target_w: int = 320) -> np.ndarray:
     h, w = frame.shape[:2]
     if w > target_w:
         scale = target_w / float(w)
         frame = cv2.resize(frame, (target_w, max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
-    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return frame
 
-def _flow_mag(prev_gray: np.ndarray, gray: np.ndarray) -> float:
+_RADIAL_CACHE: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = {}
+
+def _radial_basis(shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
+    basis = _RADIAL_CACHE.get(shape)
+    if basis is None:
+        h, w = shape
+        ys, xs = np.mgrid[0:h, 0:w]
+        rx = xs.astype(np.float32) - (w - 1) / 2.0
+        ry = ys.astype(np.float32) - (h - 1) / 2.0
+        r  = np.sqrt(rx * rx + ry * ry) + 1e-6
+        basis = (rx / r, ry / r)
+        _RADIAL_CACHE[shape] = basis
+    return basis
+
+def _flow_stats(prev_gray: np.ndarray, gray: np.ndarray) -> Tuple[float, float]:
     flow = cv2.calcOpticalFlowFarneback(
         prev_gray, gray, None,
         pyr_scale=0.5, levels=2, winsize=15,
         iterations=2, poly_n=5, poly_sigma=1.1, flags=0
     )
     mag, _ang = cv2.cartToPolar(flow[..., 0], flow[..., 1], angleInDegrees=False)
-    return float(np.mean(mag))
+    ux, uy = _radial_basis(gray.shape)
+    div = float(np.mean(ux * flow[..., 0] + uy * flow[..., 1]))
+    return float(np.mean(mag)), div
 
 def _diff_score(prev_gray: np.ndarray, gray: np.ndarray) -> float:
-    diff = cv2.absdiff(gray, prev_gray)
-    return float(np.mean(diff))
+    return float(np.mean(cv2.absdiff(gray, prev_gray)))
 
-def motion_score_video(
-    path: str,
-    sample_every: int = 10,
-    max_samples: int = 300,
-    method: str = "diff",
-    target_w: int = 320
-) -> float:
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        return 0.0
+def _appearance(small_bgr: np.ndarray, gray: np.ndarray) -> Tuple[float, float, float, float]:
+    luma     = float(np.mean(gray)) / 255.0
+    contrast = float(np.std(gray)) / 255.0
+    sat      = float(np.mean(cv2.cvtColor(small_bgr, cv2.COLOR_BGR2HSV)[..., 1])) / 255.0
+    edges    = cv2.Canny(gray, 100, 200)
+    return luma, contrast, sat, float(np.count_nonzero(edges)) / float(edges.size)
 
-    scores: List[float] = []
-    prev_gray  = None
-    frame_idx  = 0
-    taken      = 0
+TIMELINE_KEYS = ("scores", "diff", "luma", "contrast", "sat", "edges", "div")
 
-    while taken < max_samples:
-        if not cap.grab():
-            break
-        if frame_idx % sample_every == 0:
-            ok, frame = cap.retrieve()
-            if not ok:
-                break
-            gray = _prep(frame, target_w)
-            if prev_gray is not None:
-                if method == "flow":
-                    scores.append(_flow_mag(prev_gray, gray))
-                else:
-                    scores.append(_diff_score(prev_gray, gray))
-            prev_gray = gray
-            taken += 1
-        frame_idx += 1
-
-    cap.release()
-    return float(np.mean(scores)) if scores else 0.0
-
-def _timeline_worker(args: Tuple) -> Tuple[str, Dict[str, np.ndarray], float]:
-    path, step_s, max_samples, method = args
-    tl = motion_timeline(path, step_s=step_s, max_samples=max_samples, method=method)
-    ms = float(np.mean(tl["scores"])) if tl["scores"].size else 0.0
-    return path, tl, ms
-
-def _score_worker(args: Tuple) -> Tuple[str, float]:
-    path, method = args
-    return path, motion_score_video(path, method=method)
-
-def score_all_videos(
-    videos_dir: str,
-    motion_method: str = "diff",
-    clip_strategy: str = "timeline",
-    vt_step: float = 0.25,
-    vt_max_samples: int = 1200,
-    workers: Optional[int] = None
-) -> Tuple[List[Dict], Dict[str, Dict[str, np.ndarray]]]:
-    exts  = (".mp4", ".mov", ".mkv", ".webm")
-    paths = [str(p) for p in Path(videos_dir).glob("*") if p.suffix and p.suffix.lower() in exts]
-    if not paths:
-        raise RuntimeError("No video files found in videos_dir.")
-
-    results: List[Dict] = []
-    timeline_cache: Dict[str, Dict[str, np.ndarray]] = {}
-
-    with ProcessPoolExecutor(max_workers=workers) as ex:
-        if clip_strategy == "timeline":
-            tasks = [(p, vt_step, vt_max_samples, motion_method) for p in paths]
-            for path, tl, ms in tqdm(ex.map(_timeline_worker, tasks), total=len(tasks),
-                                     desc=f"Scoring video motion ({motion_method})"):
-                timeline_cache[path] = tl
-                results.append({"path": path, "motion_score": ms})
-        else:
-            tasks = [(p, motion_method) for p in paths]
-            for path, ms in tqdm(ex.map(_score_worker, tasks), total=len(tasks),
-                                 desc=f"Scoring video motion ({motion_method})"):
-                results.append({"path": path, "motion_score": ms})
-
-    scores = np.array([r["motion_score"] for r in results], dtype=float)
-    q33, q66 = np.quantile(scores, [0.33, 0.66]) if len(scores) else (0.0, 0.0)
-
-    for r in results:
-        r["motion_bucket"] = "slow" if r["motion_score"] < q33 else ("medium" if r["motion_score"] < q66 else "fast")
-
-    results.sort(key=lambda d: d["motion_score"])
-    return results, timeline_cache
+def _empty_timeline() -> Dict:
+    tl = {k: np.array([], dtype=float) for k in TIMELINE_KEYS}
+    tl["times"] = np.array([], dtype=float)
+    tl["dur"]   = 0.0
+    return tl
 
 def motion_timeline(
     path: str,
@@ -713,10 +848,10 @@ def motion_timeline(
     max_samples: int = 1200,
     method: str = "diff",
     target_w: int = 320
-) -> Dict[str, np.ndarray]:
+) -> Dict:
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
-        return {"times": np.array([]), "scores": np.array([])}
+        return _empty_timeline()
 
     fps    = cap.get(cv2.CAP_PROP_FPS) or 0.0
     frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
@@ -725,16 +860,14 @@ def motion_timeline(
         dur = frames / fps
     if dur <= 0:
         cap.release()
-        return {"times": np.array([]), "scores": np.array([])}
-
+        return _empty_timeline()
     if fps <= 0:
         fps = (frames / dur) if dur > 0 else 30.0
 
-    step   = max(0.03, float(step_s))
-    n_steps = min(int(math.ceil(dur / step)), int(max_samples))
-    times  = np.linspace(0, dur, num=n_steps, endpoint=False).astype(float)
-    scores = np.zeros_like(times, dtype=float)
-
+    step    = max(0.03, float(step_s))
+    n_steps = max(1, min(int(math.ceil(dur / step)), int(max_samples)))
+    times   = np.linspace(0, dur, num=n_steps, endpoint=False).astype(float)
+    cols    = {k: np.zeros(n_steps, dtype=float) for k in TIMELINE_KEYS}
     target_frames = np.round(times * fps).astype(int)
 
     prev_gray = None
@@ -746,27 +879,163 @@ def motion_timeline(
         idx += 1
         if idx < target_frames[sample_i]:
             continue
-
         ok, frame = cap.retrieve()
         if not ok:
             break
-        gray = _prep(frame, target_w)
-
+        small = _prep(frame, target_w)
+        gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        luma, contrast, sat, edges = _appearance(small, gray)
+        motion = diff = div = 0.0
+        if prev_gray is not None:
+            diff = _diff_score(prev_gray, gray)
+            if method == "flow":
+                motion, div = _flow_stats(prev_gray, gray)
+            else:
+                motion = diff
         while sample_i < target_frames.size and target_frames[sample_i] <= idx:
-            if prev_gray is not None:
-                if method == "flow":
-                    scores[sample_i] = _flow_mag(prev_gray, gray)
-                else:
-                    scores[sample_i] = _diff_score(prev_gray, gray)
+            cols["scores"][sample_i]   = motion
+            cols["diff"][sample_i]     = diff
+            cols["luma"][sample_i]     = luma
+            cols["contrast"][sample_i] = contrast
+            cols["sat"][sample_i]      = sat
+            cols["edges"][sample_i]    = edges
+            cols["div"][sample_i]      = div
             sample_i += 1
         prev_gray = gray
 
     cap.release()
+    if n_steps > 3:
+        cols["scores"] = uniform_filter1d(cols["scores"], size=3)
+    tl = dict(cols)
+    tl["times"] = times
+    tl["dur"]   = float(dur)
+    return tl
 
-    if len(scores) > 3:
-        scores = uniform_filter1d(scores, size=3)
+def _timeline_worker(args: Tuple) -> Tuple[str, Dict]:
+    path, step_s, max_samples, method = args
+    return path, motion_timeline(path, step_s=step_s, max_samples=max_samples, method=method)
 
-    return {"times": times, "scores": scores}
+def score_all_videos(
+    videos_dir: str,
+    motion_method: str = "diff",
+    vt_step: float = 0.25,
+    vt_max_samples: int = 1200,
+    workers: Optional[int] = None
+) -> List[Dict]:
+    exts  = (".mp4", ".mov", ".mkv", ".webm")
+    paths = sorted(str(p) for p in Path(videos_dir).glob("*") if p.suffix and p.suffix.lower() in exts)
+    if not paths:
+        raise RuntimeError("No video files found in videos_dir.")
+
+    videos: List[Dict] = []
+    tasks = [(p, vt_step, vt_max_samples, motion_method) for p in paths]
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        for path, tl in tqdm(ex.map(_timeline_worker, tasks), total=len(tasks),
+                             desc=f"Analyzing video timelines ({motion_method})"):
+            n    = int(tl["times"].size)
+            step = float(tl["times"][1] - tl["times"][0]) if n > 1 else float(vt_step)
+            ms   = float(np.mean(tl["scores"])) if n else 0.0
+            videos.append({"path": path, "dur": float(tl["dur"]), "step": step,
+                           "timeline": tl, "motion_score": ms})
+    return videos
+
+FEATURE_DIMS = ("pace", "burst", "groove", "brightness", "noise", "bass", "density", "warmth", "slope")
+MOTION_DIMS  = ("pace", "burst", "groove")
+BASE_WEIGHTS = {"pace": 1.0, "burst": 1.0, "groove": 0.25, "brightness": 0.6, "noise": 0.4,
+                "bass": 0.4, "density": 0.3, "warmth": 0.3, "slope": 0.3}
+_DIM = {name: i for i, name in enumerate(FEATURE_DIMS)}
+
+POOL_PENALTY   = 0.20
+GAP_PENALTY    = 0.80
+PALETTE_WEIGHT = 0.20
+
+def _rolling_mean(x: np.ndarray, size: int) -> np.ndarray:
+    return uniform_filter1d(np.asarray(x, dtype=float), size=max(1, int(size)), mode="nearest")
+
+def _rolling_std(x: np.ndarray, size: int) -> np.ndarray:
+    x  = np.asarray(x, dtype=float)
+    m  = _rolling_mean(x, size)
+    m2 = _rolling_mean(x * x, size)
+    return np.sqrt(np.maximum(m2 - m * m, 0.0))
+
+def _context_groove(x: np.ndarray, ctx: int) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    n = x.size
+    if n < 8:
+        return np.zeros(n, dtype=float)
+    ctx  = int(max(8, min(ctx, n)))
+    W    = np.lib.stride_tricks.sliding_window_view(x, ctx)
+    Wc   = W - W.mean(axis=1, keepdims=True)
+    mags = np.abs(np.fft.rfft(Wc, axis=1))[:, 1:]
+    g    = mags.max(axis=1) / (mags.sum(axis=1) + 1e-9)
+    pad_l = (n - g.size) // 2
+    return np.pad(g, (pad_l, n - g.size - pad_l), mode="edge")
+
+def _cut_flags(diff: np.ndarray) -> np.ndarray:
+    diff = np.asarray(diff, dtype=float)
+    if diff.size < 3:
+        return np.zeros_like(diff)
+    d   = diff[1:]
+    med = float(np.median(d))
+    mad = float(np.median(np.abs(d - med))) * 1.4826
+    thr = max(med + 4.0 * mad, 10.0)
+    return (diff > thr).astype(float)
+
+def _raw_video_features(v: Dict) -> Optional[Dict[str, np.ndarray]]:
+    tl = v["timeline"]
+    if tl["times"].size == 0:
+        return None
+    step   = float(v["step"])
+    motion = np.asarray(tl["scores"], dtype=float)
+    cuts   = _cut_flags(tl["diff"])
+    return {
+        "pace":       motion,
+        "burst":      _rolling_std(motion, round(0.5 / step)),
+        "groove":     _context_groove(motion, round(4.0 / step)),
+        "brightness": np.asarray(tl["luma"], dtype=float),
+        "contrast":   np.asarray(tl["contrast"], dtype=float),
+        "noise":      np.asarray(tl["edges"], dtype=float),
+        "density":    _rolling_mean(cuts, round(2.0 / step)) / step,
+        "warmth":     np.asarray(tl["sat"], dtype=float),
+        "slope":      np.asarray(tl["div"], dtype=float),
+    }
+
+def _rank01(x: np.ndarray, sorted_ref: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    if sorted_ref.size == 0:
+        return np.full(x.shape, 0.5, dtype=float)
+    lo = np.searchsorted(sorted_ref, x, side="left")
+    hi = np.searchsorted(sorted_ref, x, side="right")
+    return (lo + hi) / (2.0 * sorted_ref.size)
+
+def build_library_features(videos: List[Dict]) -> Dict:
+    raws = [_raw_video_features(v) for v in videos]
+    live = [r for r in raws if r is not None]
+    for r in live:
+        r["bass"] = np.zeros_like(r["brightness"])
+    refs: Dict[str, np.ndarray] = {}
+    for k in [k for k in FEATURE_DIMS if k != "bass"] + ["contrast"]:
+        refs[k] = np.sort(np.concatenate([r[k] for r in live])) if live else np.array([], dtype=float)
+    for r in live:
+        r["bass"] = 0.5 * (1.0 - _rank01(r["brightness"], refs["brightness"])) + 0.5 * (1.0 - _rank01(r["contrast"], refs["contrast"]))
+    refs["bass"] = np.sort(np.concatenate([r["bass"] for r in live])) if live else np.array([], dtype=float)
+
+    def spread(k: str) -> bool:
+        ref = refs[k]
+        return ref.size > 0 and (float(ref[-1]) - float(ref[0])) > 1e-9
+
+    active = [spread(k) for k in FEATURE_DIMS]
+    bounds = {k: ((float(refs[k][0]), float(refs[k][-1])) if refs[k].size else (0.0, 0.0)) for k in refs}
+
+    for v, r in zip(videos, raws):
+        if r is None:
+            v["feat"]    = None
+            v["profile"] = None
+            continue
+        feat = np.stack([_rank01(r[k], refs[k]) for k in FEATURE_DIMS], axis=1)
+        v["feat"]    = feat
+        v["profile"] = feat.mean(axis=0)
+    return {"videos": videos, "active": np.array(active, dtype=bool), "bounds": bounds}
 
 def classify_audio_segment(feat: Dict, rms_q: Tuple[float, float], onset_q: Tuple[float, float]) -> str:
     energy, trans = feat["rms"], feat["onset_avg"]
@@ -775,14 +1044,6 @@ def classify_audio_segment(feat: Dict, rms_q: Tuple[float, float], onset_q: Tupl
     if energy <= rms_q[0] and trans <= onset_q[0]:
         return "slow"
     return "medium"
-
-def build_bucket_index(videos_scored: List[Dict]) -> Dict[str, List[Dict]]:
-    idx = {"slow": [], "medium": [], "fast": []}
-    for v in videos_scored:
-        idx[v["motion_bucket"]].append(v)
-    for k in idx:
-        idx[k] = sorted(idx[k], key=lambda d: d["motion_score"])
-    return idx
 
 def _minmax01(x: np.ndarray) -> Tuple[np.ndarray, float, float]:
     lo, hi = float(np.min(x)), float(np.max(x))
@@ -793,15 +1054,21 @@ def _minmax01(x: np.ndarray) -> Tuple[np.ndarray, float, float]:
 def build_segment_profiles(segments: List[Dict]) -> List[Dict]:
     arr = lambda k: np.array([s["features"].get(k, 0.0) for s in segments], dtype=float)
 
-    rms      = arr("rms")
-    onset_rt = arr("onset_rate")
-    beat_cf  = arr("beat_conf")
-    roll85   = arr("rolloff85_mean")
-    flatn    = arr("flatness_mean")
-    subr     = arr("sub_ratio")
-    nov      = arr("novelty")
+    rms       = arr("rms")
+    onset_rt  = arr("onset_rate")
+    beat_cf   = arr("beat_conf")
+    roll85    = arr("rolloff85_mean")
+    flatn     = arr("flatness_mean")
+    subr      = arr("sub_ratio")
+    nov       = arr("novelty")
     onset_std = arr("onset_std")
     nov_std   = arr("novelty_std")
+    slope     = arr("rms_slope")
+    warm_raw  = np.array([
+        s["features"].get("mode_conf", 0.5) if s["features"].get("mode", "major") == "major"
+        else 1.0 - s["features"].get("mode_conf", 0.5)
+        for s in segments
+    ], dtype=float)
 
     rms01,      _, _ = _minmax01(rms)
     onset01,    _, _ = _minmax01(onset_rt)
@@ -812,6 +1079,8 @@ def build_segment_profiles(segments: List[Dict]) -> List[Dict]:
     nov01,      _, _ = _minmax01(nov)
     onsetstd01, _, _ = _minmax01(onset_std)
     novstd01,   _, _ = _minmax01(nov_std)
+    slope01,    _, _ = _minmax01(slope)
+    warm01,     _, _ = _minmax01(warm_raw)
 
     profiles = []
     for i in range(len(segments)):
@@ -824,54 +1093,28 @@ def build_segment_profiles(segments: List[Dict]) -> List[Dict]:
             "brightness": float(bright01[i]),
             "noise":      float(noise01[i]),
             "bass":       float(bass01[i]),
-            "novelty":    float(nov01[i])
+            "novelty":    float(nov01[i]),
+            "density":    float(onset01[i]),
+            "warmth":     float(warm01[i]),
+            "slope":      float(slope01[i])
         })
+    for k in FEATURE_DIMS:
+        vals = np.array([p[k] for p in profiles], dtype=float)
+        ranks = _rank01(vals, np.sort(vals))
+        for p, x in zip(profiles, ranks):
+            p[k] = float(x)
     return profiles
 
-def compute_video_groove_raw(scores: np.ndarray) -> float:
-    if scores.size < 8:
-        return 0.0
-    x    = scores - float(np.mean(scores))
-    fft  = np.fft.rfft(x)
-    mags = np.abs(fft)
-    if mags.size <= 1:
-        return 0.0
-    return float(np.max(mags[1:]) / (np.sum(mags[1:]) + 1e-9))
+def profile_vector(p: Dict) -> np.ndarray:
+    return np.array([float(p.get(k, 0.5)) for k in FEATURE_DIMS], dtype=float)
 
-def build_video_metrics(timeline: Dict[str, np.ndarray], motion_score: float) -> Dict:
-    times  = timeline.get("times",  np.array([]))
-    scores = timeline.get("scores", np.array([]))
-    if times.size == 0 or scores.size == 0:
-        return {"pace_raw": float(motion_score), "burst_raw": 0.0, "groove_raw": 0.0}
-    return {"pace_raw": float(np.mean(scores)), "burst_raw": float(np.std(scores)), "groove_raw": compute_video_groove_raw(scores)}
-
-def av_match_score_multi(seg_prof: Dict, vm: Dict, reuse_penalty: float, recent_penalty: float) -> float:
-    d2  = (vm["pace01"]  - seg_prof["pace"])**2
-    d2 += (vm["burst01"] - seg_prof["burst"])**2
-    if "groove01" in vm:
-        d2 += 0.25*(vm["groove01"] - seg_prof.get("groove", 0.0))**2
-    return d2 + reuse_penalty + recent_penalty
-
-def _zscore(x: np.ndarray) -> np.ndarray:
-    if x.size == 0:
-        return x
-    m = float(np.mean(x))
-    s = float(np.std(x))
-    if s <= 1e-9:
-        return np.zeros_like(x, dtype=float)
-    return (x - m) / s
-
-def _corr_distance(a: np.ndarray, b: np.ndarray) -> float:
-    if a.size == 0 or b.size == 0:
-        return 1.0
-    n  = min(a.size, b.size)
-    a  = a[:n]; b = b[:n]
-    az = _zscore(a)
-    bz = _zscore(b)
-    denom = float(np.linalg.norm(az) * np.linalg.norm(bz)) + 1e-9
-    corr  = float(np.dot(az, bz) / denom)
-    corr  = max(-1.0, min(1.0, corr))
-    return float(1.0 - corr)
+def feature_weights(visual_weight: float, active: np.ndarray, pairing: str) -> np.ndarray:
+    vw = max(0.0, float(visual_weight))
+    w  = np.array([BASE_WEIGHTS[k] * (1.0 if k in MOTION_DIMS else vw) for k in FEATURE_DIMS], dtype=float)
+    w *= np.asarray(active, dtype=float)
+    if pairing != "smart":
+        w[:] = 0.0
+    return w
 
 def _interp_curve(times_src: np.ndarray, values_src: np.ndarray, times_q: np.ndarray) -> np.ndarray:
     if times_src.size == 0 or values_src.size == 0 or times_q.size == 0:
@@ -910,110 +1153,99 @@ def build_audio_curve_for_segments(
         seg_curves.append(seg_curve.astype(float))
     return seg_curves
 
-def pick_region_by_timeline_windowed(
-    timeline: Dict[str, np.ndarray],
-    target_dur: float,
-    seg_prof: Dict,
+def score_windows(
+    v: Dict,
+    win: int,
+    seg_vec: np.ndarray,
+    weights: np.ndarray,
     seg_curve: Optional[np.ndarray],
-    no_reuse: float,
-    used_windows: List[Tuple[float, float]],
-    jitter: float,
-    curve_weight: float = 0.60,
-    align_weight: float = 0.25
-) -> float:
-    times  = timeline["times"]
-    scores = timeline["scores"]
-    if times.size == 0 or target_dur <= 0:
-        return 0.0
-
-    step = float(times[1] - times[0]) if times.size > 1 else 0.1
-    win  = max(1, int(round(target_dur / max(step, 1e-6))))
-    if win > scores.size:
-        win = scores.size
-    if win <= 1:
-        w_idx = np.array([0], dtype=int)
+    curve_weight: float,
+    align_weight: float,
+    means_cache: Dict,
+    impact_weight: float = 0.0
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    feat = v["feat"]
+    n    = feat.shape[0]
+    win  = int(max(1, min(win, n)))
+    key  = (v["path"], win)
+    means = means_cache.get(key)
+    if means is None:
+        cs    = np.vstack([np.zeros((1, feat.shape[1])), np.cumsum(feat, axis=0)])
+        means = (cs[win:] - cs[:-win]) / float(win)
+        means_cache[key] = means
+    n_w  = means.shape[0]
+    wsum = float(np.sum(weights))
+    if wsum > 0:
+        d_feat = np.sum(((means - seg_vec) ** 2) * weights, axis=1) / wsum
     else:
-        w_idx = np.arange(scores.size - win + 1, dtype=int)
+        d_feat = np.zeros(n_w, dtype=float)
 
-    if win <= 1:
-        w_mean = np.array([float(np.mean(scores))], dtype=float)
-        w_std  = np.array([float(np.std(scores))],  dtype=float)
-    else:
-        cumsum = np.cumsum(np.insert(scores, 0, 0.0))
-        mean   = (cumsum[win:] - cumsum[:-win]) / win
-        sq     = scores * scores
-        cumsq  = np.cumsum(np.insert(sq, 0, 0.0))
-        var    = (cumsq[win:] - cumsq[:-win]) / win - mean * mean
-        var    = np.maximum(var, 0.0)
-        std    = np.sqrt(var)
-        w_mean, w_std = mean.astype(float), std.astype(float)
+    d_curve = np.ones(n_w, dtype=float)
+    d_align = np.zeros(n_w, dtype=float)
+    if seg_curve is not None and seg_curve.size >= 2 and win > 1:
+        motion = np.asarray(v["timeline"]["scores"], dtype=float)[:n]
+        W = np.lib.stride_tricks.sliding_window_view(motion, win)
+        c = _interp_curve(np.linspace(0.0, 1.0, seg_curve.size), seg_curve, np.linspace(0.0, 1.0, win))
+        if win >= 3:
+            cz   = c - c.mean()
+            cn   = float(np.linalg.norm(cz))
+            Wc   = W - W.mean(axis=1, keepdims=True)
+            Wn   = np.linalg.norm(Wc, axis=1)
+            corr = (Wc @ cz) / (Wn * cn + 1e-9)
+            d_curve = 1.0 - np.clip(corr, -1.0, 1.0)
+        if align_weight > 0:
+            peak    = float(np.argmax(c)) / float(win - 1)
+            d_align = (peak - W.argmax(axis=1) / float(win - 1)) ** 2
 
-    m01, _, _ = _minmax01(w_mean)
-    s01, _, _ = _minmax01(w_std)
+    d_impact = np.zeros(n_w, dtype=float)
+    if impact_weight > 0 and win > 1:
+        pace  = feat[:, _DIM["pace"]]
+        k     = int(max(1, min(win - 1, round(0.1 / max(1e-6, float(v["step"]))))))
+        cs_p  = np.concatenate([[0.0], np.cumsum(pace)])
+        front = (cs_p[1 + k : 1 + k + n_w] - cs_p[1 : 1 + n_w]) / float(k)
+        d_impact = 0.5 * (1.0 - (front - means[:, _DIM["pace"]]))
+    eff_curve = curve_weight * min(1.0, max(0.0, (win - 3) / 13.0))
+    cost = (1.0 - eff_curve) * d_feat + eff_curve * d_curve + align_weight * d_align + impact_weight * d_impact
+    return cost, means, win
 
-    curve_weight = float(max(0.0, min(1.0, curve_weight)))
-    base_weight  = 1.0 - curve_weight
-    align_weight = float(max(0.0, align_weight))
+def section_pools(
+    videos: List[Dict],
+    seg_vecs: List[np.ndarray],
+    sections: List[int],
+    weights: np.ndarray,
+    pool_frac: float
+) -> Dict[int, set]:
+    n_v  = len(videos)
+    size = n_v if pool_frac >= 1.0 else min(n_v, max(3, int(math.ceil(pool_frac * n_v))))
+    wsum = float(np.sum(weights))
+    pools: Dict[int, set] = {}
+    for sec in sorted(set(sections)):
+        members = [seg_vecs[i] for i, s in enumerate(sections) if s == sec]
+        sec_vec = np.mean(members, axis=0)
+        dists   = np.array([np.sum(((v["profile"] - sec_vec) ** 2) * weights) / wsum for v in videos], dtype=float)
+        order   = np.argsort(dists, kind="stable")
+        pools[sec] = set(int(i) for i in order[:size])
+    return pools
 
-    curve_ok = seg_curve is not None and seg_curve.size >= 2 and win >= 3
-    if curve_ok:
-        seg_curve = _interp_curve(np.linspace(0.0, 1.0, seg_curve.size), seg_curve, np.linspace(0.0, 1.0, win))
+Cand = namedtuple("Cand", "vi j win cost bright warm pace vec")
 
-    seg_peak_frac = None
-    if seg_curve is not None and seg_curve.size >= 2:
-        seg_peak_frac = float(np.argmax(seg_curve)) / float(seg_curve.size - 1)
+class _Hyp:
+    __slots__ = ("cost", "node", "use", "last", "used", "lastc", "sec")
 
-    best = None
-    for i, idx in enumerate(w_idx):
-        start = float(times[idx])
-
-        too_close = any((start < (s2 + no_reuse) and (start + target_dur) > (s2 - no_reuse)) for s2, _ in used_windows)
-        if too_close:
-            continue
-
-        d_p     = (float(m01[i]) - float(seg_prof.get("pace",  0.5)))
-        d_b     = (float(s01[i]) - float(seg_prof.get("burst", 0.5)))
-        d_basic = d_p*d_p + d_b*d_b
-
-        win_scores = scores[idx:idx + win].astype(float)
-
-        d_curve = 1.0
-        if curve_ok:
-            w01, _, _  = _minmax01(win_scores)
-            d_curve    = _corr_distance(seg_curve.astype(float), w01.astype(float))
-
-        d_align = 0.0
-        if align_weight > 0 and seg_peak_frac is not None and win > 1:
-            win_peak_frac = float(np.argmax(win_scores)) / float(win - 1)
-            d_align = (seg_peak_frac - win_peak_frac) ** 2
-
-        score = base_weight * d_basic + curve_weight * d_curve + align_weight * d_align
-
-        if best is None or score < best[0]:
-            best = (score, start)
-
-    if best is None:
-        dur_est = float(times[-1] if times.size else target_dur * 2)
-        for _ in range(20):
-            start     = random.uniform(0.0, max(0.0, dur_est - target_dur))
-            too_close = any((start < (s2 + no_reuse) and (start + target_dur) > (s2 - no_reuse)) for s2, _ in used_windows)
-            if not too_close:
-                best = (0.0, start)
-                break
-
-    start = 0.0 if best is None else best[1]
-    if jitter > 0:
-        start = max(0.0, start + random.uniform(-jitter, jitter))
-    return start
+    def __init__(self, cost, node, use, last, used, lastc, sec):
+        self.cost  = cost
+        self.node  = node
+        self.use   = use
+        self.last  = last
+        self.used  = used
+        self.lastc = lastc
+        self.sec   = sec
 
 def choose_clips_for_segments(
     segments: List[Dict],
-    bucket_index: Dict[str, List[Dict]],
+    library: Dict,
     audio_seg_curves: Optional[List[np.ndarray]] = None,
     clip_strategy: str = "timeline",
-    vt_step: float = 0.25,
-    vt_max_samples: int = 1200,
-    motion_method: str = "diff",
     no_reuse: float = 1.25,
     jitter: float = 0.15,
     diversity_cooldown: int = 3,
@@ -1023,130 +1255,212 @@ def choose_clips_for_segments(
     min_source_gap: int = 0,
     clip_topk: int = 4,
     reuse_penalty: float = 0.30,
-    timeline_cache: Optional[Dict[str, Dict[str, np.ndarray]]] = None
+    beam_width: int = 8,
+    visual_weight: float = 1.0,
+    pool_frac: float = 0.5,
+    impact_weight: float = 0.25
 ) -> List[Dict]:
-    video_meta: Dict[str, Dict] = {}
-    timeline_cache = timeline_cache or {}
+    videos = [v for v in library["videos"] if v.get("feat") is not None and v["feat"].shape[0] > 0]
+    if not videos:
+        raise RuntimeError("No analyzable videos available to choose from.")
 
-    def ensure_meta(vpath: str, motion_score: float):
-        if vpath in video_meta:
-            return video_meta[vpath]
-        if clip_strategy == "timeline":
-            tl = timeline_cache.get(vpath)
-            if tl is None:
-                tl = motion_timeline(vpath, step_s=vt_step, max_samples=vt_max_samples, method=motion_method)
-        else:
-            tl = {"times": np.array([]), "scores": np.array([])}
-        vm = {"dur": ffprobe_duration(vpath), "timeline": tl, "used": [], "motion_score": float(motion_score)}
-        vm.update(build_video_metrics(tl, vm["motion_score"]))
-        video_meta[vpath] = vm
-        return vm
+    rng = random.Random(1337)
+    n_v = len(videos)
+    if min_source_gap > 0:
+        gap_req = min(min_source_gap, n_v - 1)
+    else:
+        gap_req = max(diversity_cooldown, (n_v + 1) // 2)
+    gap_req = max(0, min(gap_req, n_v - 1))
 
-    use_count = defaultdict(int)
-    last_idx: Dict[str, int] = {}
-    rng       = random.Random(1337)
+    curve_weight = float(max(0.0, min(1.0, curve_weight)))
+    align_weight = float(max(0.0, align_weight))
+    beam_width   = max(1, int(beam_width))
+    clip_topk    = max(1, int(clip_topk))
+    max_cands    = max(16, 4 * beam_width)
 
-    seg_profiles = build_segment_profiles(segments) if pairing == "smart" else [{} for _ in segments]
-    chosen: List[Dict] = []
+    weights = feature_weights(visual_weight, library["active"], pairing)
+    if clip_strategy != "timeline":
+        weights = np.zeros_like(weights)
+    profiles = build_segment_profiles(segments)
+    seg_vecs = [profile_vector(p) for p in profiles]
+    sections = [int(s.get("section", 0)) for s in segments]
+    pools    = None
+    if float(np.sum(weights)) > 0 and pool_frac < 1.0:
+        pools = section_pools(videos, seg_vecs, sections, weights, pool_frac)
 
-    all_cands = []
-    for lst in bucket_index.values():
-        all_cands.extend(lst)
+    bi, wi, pi = _DIM["brightness"], _DIM["warmth"], _DIM["pace"]
 
-    seen         = set()
-    unique_cands = []
-    for c in all_cands:
-        if c["path"] not in seen:
-            seen.add(c["path"])
-            unique_cands.append(c)
+    def make_cand(vi: int, j: int, win: int, cost_j: float, pool_pen: float, means: np.ndarray) -> Cand:
+        return Cand(vi, j, win, float(cost_j) + pool_pen,
+                    float(means[j, bi]), float(means[j, wi]), float(means[j, pi]), means[j].copy())
 
-    for c in unique_cands:
-        ensure_meta(c["path"], c["motion_score"])
+    means_cache: Dict = {}
+    beam = [_Hyp(0.0, None, {}, {}, {}, None, None)]
 
-    pace_raw  = np.array([video_meta[c["path"]]["pace_raw"]  for c in unique_cands], dtype=float) if unique_cands else np.array([0.0])
-    burst_raw = np.array([video_meta[c["path"]]["burst_raw"] for c in unique_cands], dtype=float) if unique_cands else np.array([0.0])
-    groove_raw= np.array([video_meta[c["path"]]["groove_raw"]for c in unique_cands], dtype=float) if unique_cands else np.array([0.0])
-
-    p01, _, _ = _minmax01(pace_raw)
-    b01, _, _ = _minmax01(burst_raw)
-    g01, _, _ = _minmax01(groove_raw)
-
-    for i, c in enumerate(unique_cands):
-        vm = video_meta[c["path"]]
-        vm["pace01"]  = float(p01[i])
-        vm["burst01"] = float(b01[i])
-        vm["groove01"]= float(g01[i])
-
-    for seg_idx, s in enumerate(segments):
-        bucket = s["bucket"]
-        cands  = bucket_index.get(bucket) or bucket_index.get("medium") or sum(bucket_index.values(), [])
-        if not cands:
-            raise RuntimeError("No scored videos available to choose from.")
-
-        n_pool = len({c["path"] for c in cands})
-        if min_source_gap > 0:
-            gap_req = min(min_source_gap, n_pool - 1)
-        else:
-            gap_req = max(diversity_cooldown, (n_pool + 1) // 2)
-        gap_req = max(0, min(gap_req, n_pool - 1))
-
-        def gap_of(path: str) -> int:
-            li = last_idx.get(path)
-            return (seg_idx - li) if li is not None else 1_000_000
-
-        if pairing == "smart":
-            seg_prof_sel = seg_profiles[seg_idx]
-            def match_of(cand):
-                reuse = reuse_penalty * use_count[cand["path"]]
-                return av_match_score_multi(seg_prof_sel, video_meta[cand["path"]], reuse, 0.0)
-        else:
-            def match_of(cand):
-                return 0.0
-
-        eligible = [c for c in cands if gap_of(c["path"]) >= gap_req]
-        if not eligible:
-            max_gap  = max(gap_of(c["path"]) for c in cands)
-            eligible = [c for c in cands if gap_of(c["path"]) == max_gap]
-
-        eligible.sort(key=lambda c: (match_of(c), use_count[c["path"]], c["path"]))
-        k    = max(1, min(clip_topk, len(eligible)))
-        pick = rng.choice(eligible[:k])
-
-        use_count[pick["path"]] += 1
-        last_idx[pick["path"]]   = seg_idx
-
-        meta   = video_meta[pick["path"]]
-        target = float(s["duration"])
-
+    for t, seg in enumerate(segments):
+        target  = float(seg["duration"])
+        sec     = sections[t]
+        seg_vec = seg_vecs[t]
         seg_curve = None
-        if audio_seg_curves is not None and seg_idx < len(audio_seg_curves):
-            seg_curve = audio_seg_curves[seg_idx]
+        if clip_strategy == "timeline" and audio_seg_curves is not None and t < len(audio_seg_curves):
+            seg_curve = audio_seg_curves[t]
 
-        if clip_strategy == "timeline" and meta["timeline"]["times"].size > 0:
-            start_t = pick_region_by_timeline_windowed(
-                meta["timeline"],
-                target_dur=target,
-                seg_prof=seg_profiles[seg_idx] if pairing == "smart" else {"pace": 0.5, "burst": 0.5},
-                seg_curve=seg_curve,
-                no_reuse=no_reuse,
-                used_windows=meta["used"],
-                jitter=jitter,
-                curve_weight=curve_weight,
-                align_weight=align_weight
-            )
-        else:
-            start_t = rng.uniform(0.0, max(0.0, meta["dur"] - target)) if meta["dur"] > target else 0.0
+        primary: List[Cand]   = []
+        secondary: List[Cand] = []
+        for vi, v in enumerate(videos):
+            win = max(1, int(round(target / v["step"])))
+            cost, means, win = score_windows(v, win, seg_vec, weights, seg_curve, curve_weight, align_weight, means_cache,
+                                             impact_weight if clip_strategy == "timeline" else 0.0)
+            pool_pen = POOL_PENALTY if (pools is not None and vi not in pools[sec]) else 0.0
+            if clip_strategy != "timeline":
+                j = rng.randint(0, cost.size - 1)
+                primary.append(make_cand(vi, j, win, cost[j], pool_pen, means))
+                continue
+            order = np.argsort(cost, kind="stable")
+            taken: List[int] = []
+            for j in order[: max(50, 25 * clip_topk)]:
+                j = int(j)
+                if any(abs(j - q) < win for q in taken):
+                    continue
+                taken.append(j)
+                c = make_cand(vi, j, win, cost[j], pool_pen, means)
+                (primary if len(taken) == 1 else secondary).append(c)
+                if len(taken) >= clip_topk:
+                    break
+        secondary.sort(key=lambda c: (c.cost, c.vi, c.j))
+        cands = primary + secondary[: max(0, max_cands - len(primary))]
 
-        meta["used"].append((start_t, start_t + target))
+        scored: List[Tuple[float, int, Cand]] = []
+        for h_i, h in enumerate(beam):
+            prev     = h.lastc
+            boundary = prev is not None and sec != h.sec
+            for c in cands:
+                if prev is not None and c.vi == prev.vi and n_v > 1:
+                    continue
+                used = h.used.get(c.vi)
+                if used:
+                    nr = no_reuse / videos[c.vi]["step"]
+                    if any(c.j < ue + nr and c.j + c.win > us - nr for us, ue in used):
+                        continue
+                total = h.cost + c.cost + reuse_penalty * h.use.get(c.vi, 0)
+                li = h.last.get(c.vi)
+                if li is not None and (t - li) < gap_req:
+                    total += GAP_PENALTY * (gap_req - (t - li)) / float(max(1, gap_req))
+                if prev is not None and not boundary:
+                    total += PALETTE_WEIGHT * 0.5 * (abs(c.bright - prev.bright) + abs(c.warm - prev.warm))
+                scored.append((total, h_i, c))
+        if not scored:
+            for h_i, h in enumerate(beam):
+                prev = h.lastc
+                pool = [c for c in cands if prev is None or c.vi != prev.vi] or cands
+                c = min(pool, key=lambda c: (c.cost, c.vi, c.j))
+                scored.append((h.cost + c.cost, h_i, c))
+        scored.sort(key=lambda x: (x[0], x[1], x[2].vi, x[2].j))
+
+        new_beam: List[_Hyp] = []
+        for total, h_i, c in scored[:beam_width]:
+            h    = beam[h_i]
+            use  = dict(h.use)
+            last = dict(h.last)
+            used = {k: list(vv) for k, vv in h.used.items()}
+            use[c.vi] = use.get(c.vi, 0) + 1
+            last[c.vi] = t
+            used.setdefault(c.vi, []).append((c.j, c.j + c.win))
+            new_beam.append(_Hyp(total, (c, h.node), use, last, used, c, sec))
+        beam = new_beam
+
+    best  = min(beam, key=lambda h: h.cost)
+    picks: List[Cand] = []
+    node  = best.node
+    while node is not None:
+        c, node = node
+        picks.append(c)
+    picks.reverse()
+
+    chosen: List[Dict] = []
+    for t, c in enumerate(picks):
+        v      = videos[c.vi]
+        target = float(segments[t]["duration"])
+        start  = c.j * v["step"]
+        if jitter > 0:
+            start += rng.uniform(-jitter, jitter)
+        if v["dur"] > target:
+            start = min(start, v["dur"] - target)
+        start  = max(0.0, start)
+        bucket = "slow" if c.pace < 1.0 / 3.0 else ("medium" if c.pace < 2.0 / 3.0 else "fast")
         chosen.append({
-            "path":         pick["path"],
-            "motion_score": pick["motion_score"],
-            "bucket":       pick["motion_bucket"],
-            "start":        float(max(0.0, start_t)),
-            "src_dur":      float(meta["dur"])
+            "path":         v["path"],
+            "motion_score": float(v["motion_score"]),
+            "bucket":       bucket,
+            "start":        float(start),
+            "src_dur":      float(v["dur"]),
+            "section":      sections[t],
+            "match_cost":   float(c.cost),
+            "segment_profile": {k: float(profiles[t].get(k, 0.5)) for k in FEATURE_DIMS},
+            "window_profile":  {k: float(x) for k, x in zip(FEATURE_DIMS, c.vec)}
         })
-
     return chosen
+
+def _ff_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+
+def build_reactive_commands(
+    curves: Dict,
+    beat_times: np.ndarray,
+    beat_strengths: np.ndarray,
+    tempo: float,
+    duration: float,
+    fps: int,
+    cut_lead_frames: int,
+    pulse_strength: float,
+    react_strength: float,
+    path: str
+) -> bool:
+    pulse_strength = float(max(0.0, pulse_strength))
+    react_strength = float(max(0.0, react_strength))
+    if pulse_strength <= 0 and react_strength <= 0:
+        return False
+    n_frames = int(math.ceil(duration * fps)) + 1
+    t_video  = np.arange(n_frames, dtype=float) / float(fps)
+    t_audio  = t_video + max(0, int(cut_lead_frames)) / float(fps)
+    sat      = np.ones(n_frames, dtype=float)
+    bright   = np.zeros(n_frames, dtype=float)
+
+    beats = np.asarray(beat_times, dtype=float)
+    if pulse_strength > 0 and beats.size:
+        if tempo and tempo > 0:
+            period = 60.0 / float(tempo)
+        elif beats.size >= 2:
+            period = float(np.median(np.diff(beats)))
+        else:
+            period = 0.5
+        tau       = max(1.0 / fps, period / 3.0)
+        strengths = np.asarray(beat_strengths, dtype=float)
+        if strengths.size != beats.size:
+            strengths = np.ones(beats.size, dtype=float)
+        idx   = np.searchsorted(beats, t_audio, side="right") - 1
+        valid = idx >= 0
+        dt    = t_audio[valid] - beats[idx[valid]]
+        amp   = pulse_strength * (0.5 + 0.5 * strengths[idx[valid]])
+        sat[valid] = 1.0 + amp * np.exp(-dt / tau)
+
+    if react_strength > 0:
+        hop_times = np.asarray(curves.get("hop_times", np.array([])), dtype=float)
+        env       = np.asarray(curves.get("onset_env", np.array([])), dtype=float)
+        if hop_times.size and env.size:
+            hi      = float(np.percentile(env, 95)) + 1e-9
+            sampled = _interp_curve(hop_times, np.clip(env / hi, 0.0, 1.0), t_audio)
+            release = math.exp(-1.0 / (fps * 0.12))
+            level   = 0.0
+            for k in range(n_frames):
+                level     = max(float(sampled[k]), level * release)
+                bright[k] = react_strength * level
+
+    with open(path, "w", encoding="utf-8") as f:
+        for k in range(n_frames):
+            t_cmd = max(0.0, (k - 0.5) / float(fps))
+            f.write(f"{t_cmd:.6f} [enter] eq@react saturation {sat[k]:.4f}, eq@react brightness {bright[k]:.4f};\n")
+    return True
 
 def build_ffmpeg_graph(
     audio_path: str,
@@ -1158,9 +1472,9 @@ def build_ffmpeg_graph(
     crf: int,
     preset: str,
     out_path: str,
-    bpm: float = 0.0,
-    beat_offset: float = 0.0,
-    pulse_strength: float = 0.15,
+    zoom_depths: Optional[List[float]] = None,
+    zoom_in: Optional[List[bool]] = None,
+    react_cmds: Optional[str] = None,
     trail_frames: int = 6,
     trail_decay: float = 0.70,
     trail_opacity: float = 0.35,
@@ -1169,11 +1483,9 @@ def build_ffmpeg_graph(
 ):
     cut_lead_frames = int(max(0, cut_lead_frames))
     seg_frames: List[int] = []
-    seg_start_frames: List[int] = []
     cum_time   = 0.0
     prev_frame = 0
     for seg in segments:
-        seg_start_frames.append(prev_frame)
         cum_time  += max(0.0, float(seg["duration"]))
         cur_frame  = int(round(cum_time * fps)) - cut_lead_frames
         cur_frame  = max(prev_frame + 1, cur_frame)
@@ -1186,14 +1498,8 @@ def build_ffmpeg_graph(
         read_window = max(0.001, float(seg["duration"])) + 0.5
         cmd += ["-ss", f"{start:.6f}", "-t", f"{read_window:.6f}", "-i", c["path"]]
 
-    rng        = random.Random(1337)
-    directions = ["in", "out", "left", "right", "up", "down", "inleft", "inright", "inup", "indown"]
-
-    def pulse_scale_for_bucket(bucket: str) -> float:
-        return 0.85 if bucket == "slow" else (1.0 if bucket == "medium" else 1.25)
-
-    beats_per_sec  = (bpm / 60.0) if bpm and bpm > 0 else 0.0
-    enable_pulse   = (pulse_strength is not None and pulse_strength > 0 and beats_per_sec > 0)
+    rng  = random.Random(1337)
+    pans = ["", "left", "right", "up", "down"]
 
     trail_frames   = int(max(0, trail_frames))
     trail_decay    = float(max(0.0, min(1.0, trail_decay)))
@@ -1204,29 +1510,26 @@ def build_ffmpeg_graph(
         w = [decay**k for k in range(frames)]
         return " ".join(f"{x:.6f}" for x in w)
 
-    def zoom_mag_for_bucket(bucket: str) -> float:
-        return 0.01 if bucket == "slow" else (0.015 if bucket == "medium" else 0.02)
-
     filters, labels = [], []
     for i, (seg, ch) in enumerate(zip(segments, chosen), start=1):
-        N       = max(1, int(seg_frames[i-1]))
-        target  = N / float(fps)
-        bucket  = str(ch.get("bucket", "medium"))
-        style   = rng.choice(directions)
-        zoom_amt= zoom_mag_for_bucket(bucket)
-        prog    = f"min(1,on/{N})"
+        N        = max(1, int(seg_frames[i-1]))
+        target   = N / float(fps)
+        zoom_amt = float(zoom_depths[i-1]) if zoom_depths is not None and i-1 < len(zoom_depths) else 0.015
+        inward   = bool(zoom_in[i-1]) if zoom_in is not None and i-1 < len(zoom_in) else True
+        pan      = rng.choice(pans)
+        prog     = f"min(1,on/{N})"
 
-        if "out" in style and "in" not in style:
-            z_expr = f"1+{zoom_amt}*(1-{prog})"
+        if inward:
+            z_expr = f"1+{zoom_amt:.4f}*{prog}"
         else:
-            z_expr = f"1+{zoom_amt}*{prog}"
+            z_expr = f"1+{zoom_amt:.4f}*(1-{prog})"
 
         pan_frac_x = 0.0
         pan_frac_y = 0.0
-        if "left"  in style: pan_frac_x = -0.02
-        if "right" in style: pan_frac_x =  0.02
-        if "up"    in style: pan_frac_y = -0.02
-        if "down"  in style: pan_frac_y =  0.02
+        if pan == "left":  pan_frac_x = -0.02
+        if pan == "right": pan_frac_x =  0.02
+        if pan == "up":    pan_frac_y = -0.02
+        if pan == "down":  pan_frac_y =  0.02
 
         x_expr = f"(iw-iw/zoom)/2+({pan_frac_x})*iw*{prog}"
         y_expr = f"(ih-ih/zoom)/2+({pan_frac_y})*ih*{prog}"
@@ -1239,11 +1542,6 @@ def build_ffmpeg_graph(
         chain += f",crop={width}:{height},setsar=1"
         chain += f",zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d=1:s={width}x{height}:fps={fps}"
         chain += f",eq=saturation=1.04:gamma=1.02"
-
-        if enable_pulse:
-            amp    = pulse_strength * pulse_scale_for_bucket(bucket)
-            seg_t0 = seg_start_frames[i-1] / float(fps)
-            chain += f",hue=s='1+{amp:.6f}*cos(2*PI*{beats_per_sec:.6f}*(t+{seg_t0 - beat_offset:.6f}))'"
 
         midlab  = f"seg{i}"
         chain  += f"[{midlab}]"
@@ -1261,7 +1559,11 @@ def build_ffmpeg_graph(
         else:
             labels.append(f"[{midlab}]")
 
-    filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=1:a=0[vout]")
+    if react_cmds:
+        filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=1:a=0[vcat]")
+        filters.append(f"[vcat]sendcmd=f='{_ff_escape(react_cmds)}',eq@react=eval=frame[vout]")
+    else:
+        filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=1:a=0[vout]")
     cmd += [
         "-filter_complex", ";".join(filters),
         "-map", "[vout]", "-map", "0:a:0",
@@ -1286,8 +1588,7 @@ def process_one(
     audio_path: str,
     out_path: Path,
     args,
-    bucket_index: Dict[str, List[Dict]],
-    timeline_cache: Dict[str, Dict[str, np.ndarray]],
+    library: Dict,
     manifest_path: Optional[Path] = None,
     label: str = ""
 ) -> None:
@@ -1320,12 +1621,17 @@ def process_one(
         beat_tracker=args.beat_tracker,
         snap=args.snap,
         snap_tol_beats=args.snap_tol_beats,
-        beats_per_bar=args.beats_per_bar
+        beats_per_bar=args.beats_per_bar,
+        sections=args.sections,
+        quiet_hold_beats=args.quiet_hold,
+        beat_refine_s=max(0.0, args.beat_refine_ms) / 1000.0
     )
 
     segments = audio_info["segments"]
     if not segments:
         raise RuntimeError(f"No segments found in {audio_path}.")
+    sections = audio_info.get("sections", [])
+    print(f"{label}{len(segments)} segments in {len(sections)} section(s), tempo {audio_info['tempo']:.1f} BPM")
 
     rms_vals   = np.array([s["features"]["rms"]       for s in segments], dtype=float)
     onset_vals = np.array([s["features"]["onset_avg"] for s in segments], dtype=float)
@@ -1353,15 +1659,12 @@ def process_one(
             curve_method=args.curve_method
         )
 
-    print(f"{label}Choosing diverse clip regions...")
+    print(f"{label}Matching clip windows (beam width {args.beam_width})...")
     chosen = choose_clips_for_segments(
         segments=segments,
-        bucket_index=bucket_index,
+        library=library,
         audio_seg_curves=audio_seg_curves,
         clip_strategy=args.clip_strategy,
-        vt_step=args.vt_step,
-        vt_max_samples=args.vt_max_samples,
-        motion_method=args.motion_method,
         no_reuse=args.no_reuse,
         jitter=args.clip_jitter,
         diversity_cooldown=args.diversity_cooldown,
@@ -1371,12 +1674,23 @@ def process_one(
         min_source_gap=args.min_source_gap,
         clip_topk=args.clip_topk,
         reuse_penalty=args.reuse_penalty,
-        timeline_cache=timeline_cache
+        beam_width=args.beam_width,
+        visual_weight=args.visual_weight,
+        pool_frac=args.pool_frac,
+        impact_weight=args.impact_weight
     )
+    distinct = len({c["path"] for c in chosen})
+    avg_cost = float(np.mean([c["match_cost"] for c in chosen])) if chosen else 0.0
+    print(f"{label}Used {distinct} distinct source(s) across {len(chosen)} cuts, mean match cost {avg_cost:.3f}.")
 
-    pulse_bpm   = args.bpm if args.bpm and args.bpm > 0 else audio_info.get("tempo", 0.0)
-    beat_times  = audio_info.get("beat_times", np.array([]))
-    beat_offset = 0.0 if args.segment_mode == "grid" or len(beat_times) == 0 else float(beat_times[0])
+    beat_times     = np.asarray(audio_info.get("beat_times", np.array([])), dtype=float)
+    beat_strengths = np.asarray(audio_info.get("beat_strengths", np.array([])), dtype=float)
+    if args.segment_mode == "grid" and args.bpm and args.bpm > 0:
+        beat_times     = np.arange(0.0, float(audio_info["duration"]), 60.0 / float(args.bpm), dtype=float)
+        beat_strengths = np.ones(beat_times.size, dtype=float)
+    profiles    = build_segment_profiles(segments)
+    zoom_depths = [0.01 + 0.01 * float(p.get("pace", 0.5)) for p in profiles]
+    zoom_in     = [float(s["features"].get("rms_slope", 0.0)) >= 0.0 for s in segments]
 
     if manifest_path is None:
         manifest_path = out_path.with_suffix(".json")
@@ -1400,23 +1714,36 @@ def process_one(
         "min_source_gap": args.min_source_gap,
         "clip_topk":      args.clip_topk,
         "reuse_penalty":  args.reuse_penalty,
-        "pulse_bpm":      pulse_bpm,
-        "beat_offset":    beat_offset,
+        "beam_width":     args.beam_width,
+        "visual_weight":  args.visual_weight,
+        "pool_frac":      args.pool_frac,
+        "quiet_hold":     args.quiet_hold,
+        "fps":            args.fps,
+        "pulse_strength": args.pulse_strength,
+        "react_strength": args.react_strength,
+        "impact_weight":  args.impact_weight,
+        "beat_refine_ms": args.beat_refine_ms,
+        "beat_times":     [round(float(b), 4) for b in beat_times],
         "clip_strategy":  args.clip_strategy,
         "motion_method":  args.motion_method,
         "curve_method":   args.curve_method,
         "curve_weight":   args.curve_weight,
+        "sections":       sections,
         "placements": [
             {
                 "segment_start":    s["start"],
                 "segment_end":      s["end"],
                 "segment_duration": s["duration"],
+                "section":          s.get("section", 0),
                 "audio_features":   s["features"],
                 "desired_bucket":   s["bucket"],
                 "chosen_clip":      c["path"],
                 "chosen_motion_score": c["motion_score"],
                 "chosen_bucket":    c["bucket"],
-                "clip_start_offset": c["start"]
+                "clip_start_offset": c["start"],
+                "match_cost":       c["match_cost"],
+                "segment_profile":  c["segment_profile"],
+                "window_profile":   c["window_profile"]
             }
             for s, c in zip(segments, chosen)
         ],
@@ -1426,29 +1753,42 @@ def process_one(
         json.dump(meta, f, indent=2)
     print(f"{label}Wrote manifest: {manifest_path}")
 
-    print(f"{label}Building ffmpeg graph...")
-    cmd = build_ffmpeg_graph(
-        audio_path=audio_path,
-        segments=segments,
-        chosen=chosen,
-        fps=args.fps,
-        width=args.width,
-        height=args.height,
-        crf=args.crf,
-        preset=args.preset,
-        out_path=str(out_path),
-        bpm=pulse_bpm,
-        beat_offset=beat_offset,
-        pulse_strength=args.pulse_strength,
-        trail_frames=args.trail_frames,
-        trail_decay=args.trail_decay,
-        trail_opacity=args.trail_opacity,
-        trail_mode=args.trail_mode,
-        cut_lead_frames=args.cut_lead
-    )
+    react_fd, react_path = tempfile.mkstemp(prefix="avsync_react_", suffix=".txt")
+    os.close(react_fd)
+    try:
+        has_react = build_reactive_commands(
+            audio_info["curves"], beat_times, beat_strengths, float(audio_info.get("tempo", 0.0)),
+            float(audio_info["duration"]), args.fps, args.cut_lead,
+            args.pulse_strength, args.react_strength, react_path
+        )
+        print(f"{label}Building ffmpeg graph...")
+        cmd = build_ffmpeg_graph(
+            audio_path=audio_path,
+            segments=segments,
+            chosen=chosen,
+            fps=args.fps,
+            width=args.width,
+            height=args.height,
+            crf=args.crf,
+            preset=args.preset,
+            out_path=str(out_path),
+            zoom_depths=zoom_depths,
+            zoom_in=zoom_in,
+            react_cmds=react_path if has_react else None,
+            trail_frames=args.trail_frames,
+            trail_decay=args.trail_decay,
+            trail_opacity=args.trail_opacity,
+            trail_mode=args.trail_mode,
+            cut_lead_frames=args.cut_lead
+        )
 
-    print(f"{label}Rendering with ffmpeg...")
-    run(cmd)
+        print(f"{label}Rendering with ffmpeg...")
+        run(cmd)
+    finally:
+        try:
+            os.remove(react_path)
+        except OSError:
+            pass
     print(f"{label}Done -> {out_path}")
 
 def main():
@@ -1471,10 +1811,14 @@ def main():
     ap.add_argument("--out-dir", "--out_dir", dest="out_dir", default="output",
                     help="Directory for rendered videos and manifests (default: output).")
 
-    ap.add_argument("--segment-mode", choices=["auto", "onsets", "bars", "grid"], default="auto")
+    ap.add_argument("--segment-mode", choices=["beats", "auto", "onsets", "bars", "grid"], default="beats",
+                    help="'beats' cuts on every detected beat, refined to the nearest onset (default). "
+                         "'auto'/'onsets' cut on onsets, 'bars' on downbeats, 'grid' on a fixed --bpm grid.")
     ap.add_argument("--bpm",    type=float, default=0.0,
-                    help="Required for segment-mode=grid. Also overrides the detected tempo for the pulse.")
-    ap.add_argument("--subdiv", type=int,   default=1,   help="For grid mode: beats subdiv (1=beats, 2=half, 4=quarter, etc.)")
+                    help="Required for segment-mode=grid; in grid mode the beat pulse follows this grid too.")
+    ap.add_argument("--subdiv", type=int,   default=1,   help="For beats/grid modes: cuts per beat (1=every beat, 2=half-beats, 4=quarter-beats).")
+    ap.add_argument("--beat-refine-ms", type=float, default=60.0,
+                    help="In beats mode, move each beat cut onto the nearest onset peak within this many ms (0 disables).")
 
     ap.add_argument("--min-seg",          type=float, default=0.20,
                     help="Minimum segment length (s). Lower = tighter, faster cuts (default: 0.20).")
@@ -1503,16 +1847,23 @@ def main():
     ap.add_argument("--cut-lead", type=int, default=1,
                     help="Shift cuts this many frames earlier so the new shot leads the beat.")
 
+    ap.add_argument("--sections",   type=int,   default=0,
+                    help="Number of musical sections to detect from timbre and harmony (0 = auto from duration).")
+    ap.add_argument("--quiet-hold", type=float, default=0.0,
+                    help="Opt-in: merge cuts in quiet passages into holds up to this many beats long. "
+                         "Default 0 keeps every cut, so each beat interval gets its own clip.")
+
     ap.add_argument("--f0", action="store_true",
                     help="Enable F0/pitch analysis (adds voiced_pct & f0_median_hz features; slow).")
 
-    ap.add_argument("--clip-strategy",    choices=["timeline", "random"], default="timeline")
+    ap.add_argument("--clip-strategy",    choices=["timeline", "random"], default="timeline",
+                    help="'timeline' matches clip windows to each segment's features; 'random' picks random windows and keeps only structure and diversity rules.")
     ap.add_argument("--vt-step",          type=float, default=0.0625,
                     help="Video motion timeline step (s). Keep well below the typical cut length so "
                          "curve matching has several points per segment (default: 0.0625).")
     ap.add_argument("--vt-max-samples",   type=int,   default=1200)
     ap.add_argument("--motion-method",    choices=["flow", "diff"], default="diff",
-                    help="Motion scoring method. 'diff' is ~20x faster than 'flow' with similar bucketing accuracy.")
+                    help="Motion scoring method. 'diff' is ~20x faster; 'flow' also measures zoom direction for matching rising/falling energy.")
     ap.add_argument("--workers",          type=int, default=0,
                     help="Parallel processes for video scoring (0 = all CPU cores).")
     ap.add_argument("--clip-jitter",      type=float, default=0.10)
@@ -1522,18 +1873,28 @@ def main():
     ap.add_argument("--min-source-gap",   type=int, default=0,
                     help="Min distinct sources that must intervene before a source repeats. 0 = auto (~half the library).")
     ap.add_argument("--clip-topk",        type=int, default=4,
-                    help="Randomly pick among this many best-matching eligible sources (higher = more varied order).")
+                    help="Best non-overlapping windows kept per source as match candidates for each segment.")
     ap.add_argument("--reuse-penalty",    type=float, default=0.30,
                     help="Match-score penalty per prior use of a source, so unused clips win close matches (0 disables).")
-    ap.add_argument("--pairing",          choices=["classic", "smart"], default="smart")
+    ap.add_argument("--pairing",          choices=["classic", "smart"], default="smart",
+                    help="'smart' matches audio and video features; 'classic' uses only curve shape, structure and diversity.")
+    ap.add_argument("--beam-width",       type=int, default=8,
+                    help="Hypotheses kept while matching clips to segments (1 = greedy).")
+    ap.add_argument("--impact-weight",    type=float, default=0.25,
+                    help="Reward for windows whose motion rises in the first 100 ms after the cut (0 disables).")
+    ap.add_argument("--visual-weight",    type=float, default=1.0,
+                    help="Weight of brightness, texture, color and cut-rate matching relative to motion (0 = motion only).")
+    ap.add_argument("--pool-frac",        type=float, default=0.5,
+                    help="Fraction of the library preferred within each musical section (1 = no section pools).")
 
     ap.add_argument("--curve-method", choices=["novelty", "onset", "rms"], default="novelty")
     ap.add_argument("--curve-weight", type=float, default=0.60,
-                    help="0..1 weight for curve correlation vs pace/burst match.")
+                    help="0..1 weight for curve correlation vs feature match.")
     ap.add_argument("--align-weight", type=float, default=0.30,
                     help="Weight for aligning the clip's motion peak to the segment's musical accent (0 disables).")
 
-    ap.add_argument("--fps",    type=int, default=30)
+    ap.add_argument("--fps",    type=int, default=60,
+                    help="Output frame rate. 60 halves cut-timing jitter versus 30 at roughly double the encode time (default: 60).")
     ap.add_argument("--width",  type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
     ap.add_argument("--crf",    type=int, default=18)
@@ -1541,7 +1902,11 @@ def main():
     ap.add_argument("--manifest", default=None)
 
     ap.add_argument("--pulse-strength", type=float, default=0.15,
-                    help="Beat-locked saturation pulse depth (0 disables; default: 0.15).")
+                    help="Saturation pulse on each detected beat: one-frame attack, third-of-a-beat decay, "
+                         "amplitude scaled by beat strength (0 disables; default: 0.15).")
+    ap.add_argument("--react-strength", type=float, default=0.08,
+                    help="Per-frame brightness lift following the audio onset envelope with a 120 ms release. "
+                         "Keep below 0.10 to stay under the luminance flash threshold (0 disables; default: 0.08).")
     ap.add_argument("--trail-frames",   type=int,   default=6)
     ap.add_argument("--trail-decay",    type=float, default=0.70)
     ap.add_argument("--trail-opacity",  type=float, default=0.35)
@@ -1572,24 +1937,25 @@ def main():
             out_path = Path(args.out_dir) / (Path(af).stem + ".mp4")
         jobs.append((af, out_path))
 
-    print("Scoring candidate videos...")
+    print("Analyzing candidate videos...")
     workers = args.workers if args.workers and args.workers > 0 else None
-    scored, timeline_cache = score_all_videos(
+    videos = score_all_videos(
         args.videos_dir,
         motion_method=args.motion_method,
-        clip_strategy=args.clip_strategy,
         vt_step=args.vt_step,
         vt_max_samples=args.vt_max_samples,
         workers=workers
     )
-    bucket_index = build_bucket_index(scored)
+    library = build_library_features(videos)
+    active  = [k for k, a in zip(FEATURE_DIMS, library["active"]) if a]
+    print(f"Library: {len(videos)} clip(s); matching on {', '.join(active)}.")
 
     failures = 0
     for i, (audio_path, out_path) in enumerate(jobs, start=1):
         label = f"[{i}/{len(jobs)}] " if len(jobs) > 1 else ""
         manifest_path = Path(args.manifest) if (args.manifest and single) else None
         try:
-            process_one(audio_path, out_path, args, bucket_index, timeline_cache,
+            process_one(audio_path, out_path, args, library,
                         manifest_path=manifest_path, label=label)
         except Exception as e:
             if single:
