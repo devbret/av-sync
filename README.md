@@ -50,6 +50,12 @@ Below are the required software programs and instructions for installing and usi
 
 Below you will find information not covered in the installation and use sections above. Including the abilities this repo is intended to demonstrate. As well as an overview of the license this code is made available with. And a way to contact the maintainer with questions, suggestions and collaboration opportunities.
 
+### RAM And CPU Usage
+
+Depending on the source media, this application will require significant CPU and RAM resources. For example, during a recent run, this software required over 30GB of RAM and 90% CPU utilization to assemble a one minute video clip.
+
+You are encouraged to start with smaller projects to develop an understanding of how your computer performs when using this tool.
+
 ### Abilities Demonstrated
 
 This project repo is intended to demonstrate an ability to do the following:
